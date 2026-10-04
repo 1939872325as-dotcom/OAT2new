@@ -725,13 +725,13 @@ class MainWindow(FluentWindow):
                 try:
                     with open(settings_file_path, 'r', encoding='utf-8') as f:
                         sd = json.load(f)
-                        target_width = sd.get('custom_res_width', 1404)
-                        target_height = sd.get('custom_res_height', 834)
+                        target_width = sd.get('custom_res_width', 1441)
+                        target_height = sd.get('custom_res_height', 812)
                         logger.info(f"从设置文件读取窗口尺寸: {target_width}x{target_height}")
                 except Exception as e:
                     logger.error(f"读取设置文件失败：{e}")
-                    target_width = 1404
-                    target_height = 834
+                    target_width = 1441
+                    target_height = 812
 
                 for hwnd in window_handles:
                     try:

@@ -208,9 +208,10 @@ class WindowChecker:
                                  actual_w: int, actual_h: int):
         """当目标客户区尺寸被窗口/模拟器拒绝时，推算一个"最接近且可达"的尺寸。
 
-        典型场景：MuMu 模拟器锁定 16:9 宽高比，而配置里的 1404x834 是 1.684，
-        永远达不到 —— 会出现「高度对、宽度多 76」和「宽度对、高度少 43」来回横跳。
-        这里按实测到的真实宽高比，取面积最接近目标的可达尺寸。
+        典型场景：MuMu 模拟器锁定 16:9 宽高比，而目标尺寸比例不是 16:9 时
+        永远达不到 —— 例如旧的默认 1404x834 是 1.684，会出现「高度对、宽度多 76」
+        和「宽度对、高度少 43」来回横跳。这里按实测到的真实宽高比，取面积最接近
+        目标的可达尺寸。（当前默认 1441x812 ≈ 1.775，接近 16:9，一般可直接达到。）
         """
         if actual_w <= 0 or actual_h <= 0:
             return (actual_w, actual_h)
@@ -230,17 +231,17 @@ class WindowChecker:
 
         target_width/height 为 None 时读取用户在设置里的「自定义分辨率」
         （custom_res_width / custom_res_height）。旧实现是硬编码 1404x834 无参调用，
-        用户改了设置也不生效。
+        用户改了设置也不生效。（该硬编码值现已改为 1441x812 并统一走设置读取。）
         """
         if target_width is None or target_height is None:
             try:
                 from OAT.tools import settings as _s
                 sd = getattr(_s, 'settings_data', {}) or {}
-                target_width = int(sd.get('custom_res_width', 1404))
-                target_height = int(sd.get('custom_res_height', 834))
+                target_width = int(sd.get('custom_res_width', 1441))
+                target_height = int(sd.get('custom_res_height', 812))
                 logger.info(f'窗口目标尺寸取自设置：{target_width}x{target_height}')
             except Exception:
-                target_width, target_height = 1404, 834
+                target_width, target_height = 1441, 812
         if not self.window_title:
             logger.error('窗口标题未设置')
             return

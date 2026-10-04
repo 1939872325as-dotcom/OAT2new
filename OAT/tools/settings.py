@@ -24,8 +24,8 @@ except Exception as e:
         'sync_mode': 'exactly_sync',
         'find_value': 85,
         'find_mode': 'opencv',
-        'custom_res_width': 1404,
-        'custom_res_height': 834,
+        'custom_res_width': 1441,
+        'custom_res_height': 812,
         'window_arrange_mode': 'diagonal',  # 窗口排列方式：diagonal（对角线）或 tile（平铺）
         'windows_per_row': 3,  # 平铺排列时一行的窗口数量
         'capture_window_mode': 'PrintWindow'  # 窗口捕获模式(PrintWindow/BitBlt)
@@ -44,6 +44,7 @@ WINDOWS_PER_ROW = settings_data.get('windows_per_row', 3)  # 平铺排列时一�
 BACKEND_GET_IMG_MODE = settings_data.get('capture_window_mode', 'PrintWindow')  # 后台获取图像模式(PrintWindow/BitBlt)
 # 模拟器后台模式（MuMu 免 ADB）
 EMULATOR_TYPE = settings_data.get('emulator_type', 'pc')
+
 HANDLE_SPEC = settings_data.get('handle_spec', 'auto')
 SCREENSHOT_METHOD = settings_data.get('screenshot_method', 'nemu_ipc')
 CONTROL_METHOD = settings_data.get('control_method', 'window_message')

@@ -370,9 +370,9 @@ class SettingsPage(QWidget):
         res_container_layout.setSpacing(4)
 
         self.custom_res_width_input = LineEdit(self)
-        self.custom_res_width_input.setPlaceholderText("例如: 1404")
+        self.custom_res_width_input.setPlaceholderText("例如: 1441")
         self.custom_res_height_input = LineEdit(self)
-        self.custom_res_height_input.setPlaceholderText("例如: 834")
+        self.custom_res_height_input.setPlaceholderText("例如: 812")
 
         res_input_row = QHBoxLayout()
         res_input_row.setSpacing(8)
@@ -394,7 +394,7 @@ class SettingsPage(QWidget):
 
         self.res_card = self._create_setting_card(
             FIF.FIT_PAGE, "自定义同步时的窗口大小",
-            "宽1404 高834 时才可以使用自动挑战",
+            "宽1441 高812 时才可以使用自动挑战",
             self, res_container
         )
         group.addSettingCard(self.res_card)
@@ -465,7 +465,7 @@ class SettingsPage(QWidget):
     def on_width_changed(self, text):
         try:
             width = int(text)
-            height = int(round(width * 834 / 1404))
+            height = int(round(width * 812 / 1441))
             self.custom_res_height_input.blockSignals(True)
             self.custom_res_height_input.setText(str(height))
             self.custom_res_height_input.blockSignals(False)
@@ -478,7 +478,7 @@ class SettingsPage(QWidget):
     def on_height_changed(self, text):
         try:
             height = int(text)
-            width = int(round(height * 1404 / 834))
+            width = int(round(height * 1441 / 812))
             self.custom_res_width_input.blockSignals(True)
             self.custom_res_width_input.setText(str(width))
             self.custom_res_width_input.blockSignals(False)
@@ -489,8 +489,8 @@ class SettingsPage(QWidget):
             self.custom_res_width_input.blockSignals(False)
 
     def load_custom_resolution_settings(self):
-        width = settings_data.get('custom_res_width', 1404)
-        height = settings_data.get('custom_res_height', 834)
+        width = settings_data.get('custom_res_width', 1441)
+        height = settings_data.get('custom_res_height', 812)
         self.custom_res_width_input.setText(str(width))
         self.custom_res_height_input.setText(str(height))
 
