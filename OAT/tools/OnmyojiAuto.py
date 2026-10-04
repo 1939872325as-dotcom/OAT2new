@@ -20,6 +20,44 @@ from OAT.utils.warning_box import warning_box
 from OAT.utils.error_handler import log_error
 from OAT.utils.OCRService import ocr_service
 from ..utils.logging import logger
+from OAT.utils.pause_state import pause_aware_sleep
+
+
+# 点击后随机等待的默认区间（秒）。每张图可在「编辑图像配置 → 点击区域设置 →
+# 点击后随机等待(秒)」里单独覆盖；这里是不单独配置时的回落值，与界面默认一致。
+DEFAULT_CLICK_WAIT_RANGE = (0.3, 5.0)
+
+
+def resolve_click_wait_range(click_wait_min, click_wait_max):
+    """把配置里的等待区间解析成 (lo, hi)，规则与管道模式的解析保持完全一致：
+
+    · 两个都没填（或都非法 / 为负）→ 默认 0.3~5；
+    · 只填一个 → 另一个按默认补（只填下限 2 → 2~5）；
+    · 写反了自动交换（8, 1 → 1~8）；
+    · 负数 / 非数字按「没填」处理。
+
+    两条路径对同一份配置必须得到同一个区间，否则「按图配置」在不同模式下
+    表现会不一致（管道模式 2~5、通用挑战模式却是 0.3~5）。
+    """
+    def _norm(raw):
+        try:
+            v = float(raw)
+        except (ValueError, TypeError):
+            return None
+        return v if v >= 0 else None
+
+    lo = _norm(click_wait_min)
+    hi = _norm(click_wait_max)
+    if lo is None and hi is None:
+        lo, hi = DEFAULT_CLICK_WAIT_RANGE
+    else:
+        if lo is None:
+            lo = DEFAULT_CLICK_WAIT_RANGE[0]
+        if hi is None:
+            hi = DEFAULT_CLICK_WAIT_RANGE[1]
+    if hi < lo:
+        lo, hi = hi, lo
+    return float(lo), float(hi)
 
 
 class OnmyojiAutomation:
@@ -411,6 +449,8 @@ class OnmyojiAutomation:
                        ocr_action: str = "",
                        ocr_region: list = None,
                        ocr_confidence_threshold: float = None,
+                       click_wait_min: float = None,
+                       click_wait_max: float = None,
                        # sync_type: str = "完全同步"
                        ) -> bool:
         """
@@ -425,6 +465,8 @@ class OnmyojiAutomation:
         :param ocr_target_text: OCR目标文字
         :param ocr_region: OCR搜索区域，客户区坐标 [x1, x2, y1, y2]；用于排除同名的其他文字
         :param ocr_confidence_threshold: OCR置信度阈值
+        :param click_wait_min: 点击后随机等待区间下限（秒），来自该图的配置；None 表示用默认 0.3
+        :param click_wait_max: 点击后随机等待区间上限（秒），来自该图的配置；None 表示用默认 5.0
         :param sync_type: 同步类型，可选值："完全同步"、"点击同步"
         :return: 是否成功执行操作
         """
@@ -444,7 +486,9 @@ class OnmyojiAutomation:
                     x, y = ocr_service.get_random_point_in_area(text_area)
                     if hidden_window:
                         # 隐藏窗口模式下使用相对坐标
-                        self._send_click_messages(int(x), int(y), sync_mode)
+                        self._send_click_messages(int(x), int(y), sync_mode,
+                                                  click_wait_min, click_wait_max,
+                                                  label=os.path.basename(logo))
                     else:
                         # 普通模式下转换为绝对坐标
                         absolute_x = self.x1 + int(x)
@@ -454,15 +498,18 @@ class OnmyojiAutomation:
                             self._win32_double_click()
                             if sync_mode and self.synchronizer.sync_enabled:
                                 self.synchronizer.sync_controller()
-                            time.sleep(random.uniform(1.5, 3.0))
+                            self._sleep_after_click(click_wait_min, click_wait_max,
+                                                    label=os.path.basename(logo))
                     return True
                 # 如果OCR未识别到文字，不输出错误信息，直接尝试图像识别
             
             # 如果OCR未启用或识别失败，使用常规图像识别
             if hidden_window:
-                return self._perform_action_hidden_window(logo, threshold, sync_mode, click_type, click_area)
+                return self._perform_action_hidden_window(logo, threshold, sync_mode, click_type, click_area,
+                                                          click_wait_min, click_wait_max)
             else:
-                return self._perform_action_normal(logo, threshold, sync_mode, click_type, click_area)
+                return self._perform_action_normal(logo, threshold, sync_mode, click_type, click_area,
+                                                   click_wait_min, click_wait_max)
         except pyautogui.FailSafeException:
             error_msg = "警告：触发了PyAutoGUI的安全模式，操作已停止"
             # 使用warning_box显示错误信息
@@ -478,7 +525,8 @@ class OnmyojiAutomation:
             log_error(error_msg)
             return False
 
-    def _perform_action_hidden_window(self, logo: str, threshold: float, sync_mode: bool, click_type: str = "image", click_area: list = None) -> bool:
+    def _perform_action_hidden_window(self, logo: str, threshold: float, sync_mode: bool, click_type: str = "image", click_area: list = None,
+                                      click_wait_min: float = None, click_wait_max: float = None) -> bool:
         """使用隐藏窗口捕获模式执行操作"""
         try:
             # 使用初始化时创建的WindowCapture实例
@@ -550,16 +598,20 @@ class OnmyojiAutomation:
                     relative_x = random.randint(max(x1, center_x - range_x), min(x2, center_x + range_x))
                     relative_y = random.randint(max(y1, center_y - range_y), min(y2, center_y + range_y))
 
-                self._send_click_messages(relative_x, relative_y, sync_mode)
+                self._send_click_messages(relative_x, relative_y, sync_mode,
+                                          click_wait_min, click_wait_max,
+                                          label=os.path.basename(logo))
                 return True
             else:
                 return False
         except Exception as e:
             logger.error(f"隐藏窗口捕获发生错误: {str(e)}")
             # 降级到常规模式
-            return self._perform_action_normal(logo, threshold, sync_mode, click_type, click_area)
+            return self._perform_action_normal(logo, threshold, sync_mode, click_type, click_area,
+                                               click_wait_min, click_wait_max)
 
-    def _perform_action_normal(self, logo: str, threshold: float, sync_mode: bool, click_type: str = "image", click_area: list = None) -> bool:
+    def _perform_action_normal(self, logo: str, threshold: float, sync_mode: bool, click_type: str = "image", click_area: list = None,
+                               click_wait_min: float = None, click_wait_max: float = None) -> bool:
         """使用常规模式执行操作"""
         # 桌面版客户端最小化后系统不再出图，前台识别必然落空；统一弹窗提示（30s 节流）
         if self.hwnd and win32gui.IsIconic(self.hwnd):
@@ -607,13 +659,18 @@ class OnmyojiAutomation:
             if sync_mode and self.synchronizer.sync_enabled:
                 self.synchronizer.sync_controller()
             
-            time.sleep(random.uniform(1.5, 3.0))
+            self._sleep_after_click(click_wait_min, click_wait_max, label=os.path.basename(logo))
             return True
 
-    def _send_click_messages(self, relative_x: int, relative_y: int, sync_mode: bool) -> None:
+    def _send_click_messages(self, relative_x: int, relative_y: int, sync_mode: bool,
+                             click_wait_min: float = None, click_wait_max: float = None,
+                             label: str = None) -> None:
         """发送点击消息，根据同步模式决定是否同步到多个窗口
         :param relative_x, relative_y: 相对坐标
         :param sync_mode: 是否启用同步
+        :param click_wait_min: 点击后随机等待区间下限（秒），来自该图的配置
+        :param click_wait_max: 点击后随机等待区间上限（秒），来自该图的配置
+        :param label: 日志里显示的图名，便于核对是哪张图的配置生效
         :param sync_type: 同步类型，可选值："完全同步"、"点击同步"
         """
         if sync_mode and self.synchronizer.sync_enabled:
@@ -641,8 +698,30 @@ class OnmyojiAutomation:
             else:
                 self.send_click_message(relative_x, relative_y)
 
-        # 等待点击操作完成
-        time.sleep(random.uniform(1.5, 3.0))
+        # 等待点击操作完成（区间来自该图的「点击后随机等待」配置，默认 0.3~5 秒）
+        self._sleep_after_click(click_wait_min, click_wait_max, label=label)
+
+    def _sleep_after_click(self, click_wait_min=None, click_wait_max=None, label: str = None) -> None:
+        """点击后的随机等待 —— 通用挑战路径的节奏控制点。
+
+        区间来自该图的「点击后随机等待」配置（默认 0.3~5 秒）。这一等替代了过去
+        写死在主循环里的 1.0~2.0 秒固定休眠：匹配到图时由这里主管节奏，主循环只在
+        「什么都没匹配到」时做一次轻量节流（见 common_challenge.py 的 NO_MATCH_WAIT）。
+        暂停不计入等待，停止则立即返回；每次都把实际秒数写进日志便于核对。
+        """
+        lo, hi = resolve_click_wait_range(click_wait_min, click_wait_max)
+        try:
+            seconds = random.uniform(lo, hi)
+        except Exception:
+            seconds = lo
+        _who = f"图 {label}" if label else "默认"
+        logger.info(f"点击后随机等待 {seconds:.2f} 秒（{_who} 区间 {lo:g}~{hi:g}）")
+        if seconds <= 0:
+            return
+        try:
+            pause_aware_sleep(seconds, 0.1)
+        except Exception:
+            time.sleep(seconds)
 
     def _complex_move(self, target_x: int, target_y: int) -> None:
         """

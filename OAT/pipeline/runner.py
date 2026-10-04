@@ -10,6 +10,16 @@ from .recognition import RecognitionEngine
 from .task_definition import Task, parse_pipeline
 
 
+# 「一张图都没匹配到」时的节流（秒）。匹配到图时，节奏由该图的
+# 「点击后随机等待」(click_wait_min/max) 接管，主循环不再额外等待。
+#
+# 这里替代的是过去写死在主循环末尾的 random.uniform(1.0, 2.0)：
+# 那段原本想解决的是「两次识别之间别太密」，但那件事现在交给每张图各自的配置来做；
+# 而「一张都没匹配到」这个场景没有图可以负责，若也一并去掉就会全速空转截图，
+# 所以保留一段固定节流兜底（值按需调整，与按图配置无关）。
+NO_MATCH_WAIT_RANGE = (0.7, 2.0)
+
+
 class PipelineRunner:
     """MAA 风格管道运行器，替换 CommonChallenge"""
 
@@ -48,7 +58,8 @@ class PipelineRunner:
         _lo, _hi = self._click_wait_range()
         _custom = [t.name for t in self.tasks
                    if getattr(t, "click_wait_min", None) is not None]
-        logger.info(f"点击后随机等待：默认 {_lo:g}~{_hi:g} 秒"
+        logger.info(f"点击后随机等待：默认 {_lo:g}~{_hi:g} 秒（节奏由它接管；"
+                    f"未匹配到任何图时另有 {NO_MATCH_WAIT_RANGE[0]:g}~{NO_MATCH_WAIT_RANGE[1]:g} 秒节流）"
                     + (f"；已单独配置的图：{', '.join(_custom)}" if _custom else "（可在 编辑图像配置 里按图修改）"))
         try:
             i = 0
@@ -77,10 +88,13 @@ class PipelineRunner:
                         return False
                 except Exception:
                     pass
-                self._check_global_tasks()
+                # 本轮是否真的点到过图：点到过则由该图的「点击后随机等待」主管节奏，
+                # 一张都没点到才走末尾那段轻量节流（替代了原来写死的 1.0~2.0 秒）
+                acted = self._check_global_tasks()
 
                 if self.current_next and self.current_next in self._task_map:
                     if self._process_next_task():
+                        acted = True
                         # 注意：_match_and_execute 已经把 current_next 改成它自己的 next 了，
                         # 所以这里必须取「刚刚匹配到的任务」。原实现写的是
                         # self._task_map[self.current_next] —— 拿到的是下一张任务（is_start 判错），
@@ -97,6 +111,7 @@ class PipelineRunner:
                             self.retry_count = 0
                 else:
                     if self._process_non_global_tasks():
+                        acted = True
                         active = self._get_last_matched()
                         if active and active.is_start:
                             i += 1
@@ -107,21 +122,24 @@ class PipelineRunner:
                                 pass
                             self.consecutive_count.clear()
                             self.retry_count = 0
-                # 两次识别之间的随机休眠（暂停不计入休眠，停止则干净退出）
-                try:
-                    _sleep_target = random.uniform(1.0, 2.0)
-                except Exception:
-                    _sleep_target = 1.0
-                try:
-                    _sleep_done = pause_aware_sleep(_sleep_target, 0.1)
-                except Exception:
-                    _sleep_done = True
-                if not _sleep_done:
+                # 只有「一张图都没匹配到」时才在这里节流（暂停不计入，停止则干净退出）。
+                # 匹配到图时节奏已由该图的「点击后随机等待」负责，这里不再叠加 ——
+                # 过去写死的 random.uniform(1.0, 2.0) 就是被这一段取代的。
+                if not acted:
                     try:
-                        logger.info("挑战已停止")
+                        _sleep_target = random.uniform(*NO_MATCH_WAIT_RANGE)
                     except Exception:
-                        pass
-                    return False
+                        _sleep_target = NO_MATCH_WAIT_RANGE[0]
+                    try:
+                        _sleep_done = pause_aware_sleep(_sleep_target, 0.1)
+                    except Exception:
+                        _sleep_done = True
+                    if not _sleep_done:
+                        try:
+                            logger.info("挑战已停止")
+                        except Exception:
+                            pass
+                        return False
 
             logger.info(f"挑战完成！共执行{times}次挑战")
             do_after_challenge(
@@ -134,13 +152,20 @@ class PipelineRunner:
             logger.error(f"挑战过程出现致命错误：{e}")
             return False
 
-    def _check_global_tasks(self) -> None:
-        """优先检测所有全局任务"""
+    def _check_global_tasks(self) -> bool:
+        """优先检测所有全局任务；返回本轮是否点到过图。
+
+        返回值供主循环判断「本轮节奏是否已由按图配置的随机等待接管」：
+        全局图被点过也算点过，此时不应再叠加末尾的未匹配节流。
+        """
+        acted = False
         for task in self._global_tasks:
             if self._match_and_execute(task):
+                acted = True
                 self.consecutive_count.clear()
                 self.retry_count = 0
                 self.next_start_time = None
+        return acted
 
     def _process_next_task(self) -> bool:
         """处理 current_next 指定的任务，返回是否匹配成功"""
@@ -275,6 +300,8 @@ class PipelineRunner:
             logger.info(f"后台滑动 ({x1},{y1}) → ({x2},{y2})，时长 {duration}s")
             self.engine.swipe(int(x1), int(y1), int(x2), int(y2),
                               duration=duration, sync_mode=self.sync_mode)
+            # 滑动也要有节奏：主循环的 1.0~2.0 秒移除后，否则滑动完立刻又去识别
+            self._sleep_after_click(task)
         elif action_type == "wait":
             raw = task.action.duration if task.action.duration is not None else 1.0
             try:

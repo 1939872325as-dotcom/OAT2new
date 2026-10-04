@@ -14,6 +14,17 @@ from OAT.utils.pause_state import is_stale, pause_aware_sleep, wait_if_paused
 from OAT.utils.warning_box import warning_box
 from OAT.utils.error_handler import log_error
 
+
+# 「一张图都没匹配到」时的节流（秒）。匹配到图时，节奏由该图的
+# 「点击后随机等待」(click_wait_min/max) 接管，主循环不再额外等待。
+#
+# 这里替代的是过去写死在主循环末尾的 random.uniform(1.0, 2.0)：
+# 那段原本想解决的是「两次识别之间别太密」，但那件事现在交给每张图各自的配置来做；
+# 而「一张都没匹配到」这个场景没有图可以负责，若也一并去掉就会全速空转截图，
+# 所以保留一段固定节流兜底（值按需调整，与按图配置无关）。
+NO_MATCH_WAIT_RANGE = (0.7, 2.0)
+
+
 class CommonChallenge:
     """
     通用挑战类，用于执行自动化挑战操作
@@ -93,7 +104,10 @@ class CommonChallenge:
                     'ocr_target_text': v.get('ocr_target_text', ''),
                     'ocr_action': v.get('ocr_action') or '点击文字所在区域',
                     'ocr_confidence_threshold': v.get('ocr_confidence_threshold', 0.8),
-                    'ocr_region': v.get('ocr_region', None)
+                    'ocr_region': v.get('ocr_region', None),
+                    # 点击后随机等待区间（秒）：每张图可单独配置，None 表示用默认 0.3~5
+                    'click_wait_min': v.get('click_wait_min', None),
+                    'click_wait_max': v.get('click_wait_max', None)
                 }
             else:
                 # 兼容旧格式
@@ -109,7 +123,9 @@ class CommonChallenge:
                     'ocr_target_text': '',
                     'ocr_action': '点击文字所在区域',
                     'ocr_confidence_threshold': 0.8,
-                    'ocr_region': None
+                    'ocr_region': None,
+                    'click_wait_min': None,
+                    'click_wait_max': None
                 }
             
             self.image_paths[k] = path
@@ -154,6 +170,9 @@ class CommonChallenge:
             NEXT_IMAGE_TIMEOUT = 15
 
             while i < self.times:
+                # 本轮是否真的点到过图：点到过则由该图的「点击后随机等待」主管节奏，
+                # 一张都没点到才走末尾那段轻量节流（替代了原来写死的 1.0~2.0 秒）
+                acted = False
                 # 全局协同暂停：暂停时阻塞等待；收到停止请求则干净退出
                 try:
                     if wait_if_paused() < 0:
@@ -192,8 +211,11 @@ class CommonChallenge:
                             click_area=info['click_area'],
                             ocr_enabled=info['ocr_enabled'],
                             ocr_target_text=info['ocr_target_text'],
-                            ocr_action=info['ocr_action']
+                            ocr_action=info['ocr_action'],
+                            click_wait_min=info['click_wait_min'],
+                            click_wait_max=info['click_wait_max']
                         ):
+                            acted = True
                             if info['message']:
                                 logger.info(info['message'])
                             # 重置连续出现次数，因为全局图片处理不影响正常流程
@@ -232,8 +254,11 @@ class CommonChallenge:
                                     ocr_target_text=info['ocr_target_text'],
                                     ocr_action=info['ocr_action'],
                                     ocr_region=info['ocr_region'],
-                                    ocr_confidence_threshold=info['ocr_confidence_threshold']
+                                    ocr_confidence_threshold=info['ocr_confidence_threshold'],
+                                    click_wait_min=info['click_wait_min'],
+                                    click_wait_max=info['click_wait_max']
                                 ):
+                                    acted = True
                                     # 增加连续出现次数（重试次数由同一张图的连续命中次数推导）
                                     count = consecutive_count.get(matched_key, 0) + 1
                                     consecutive_count[matched_key] = count
@@ -291,8 +316,11 @@ class CommonChallenge:
                                         ocr_target_text=info['ocr_target_text'],
                                         ocr_action=info['ocr_action'],
                                         ocr_region=info['ocr_region'],
-                                        ocr_confidence_threshold=info['ocr_confidence_threshold']
+                                        ocr_confidence_threshold=info['ocr_confidence_threshold'],
+                                        click_wait_min=info['click_wait_min'],
+                                        click_wait_max=info['click_wait_max']
                                     ):
+                                        acted = True
                                         # 增加连续出现次数（重试次数由同一张图的连续命中次数推导）
                                         count = consecutive_count.get(key, 0) + 1
                                         consecutive_count[key] = count
@@ -331,21 +359,24 @@ class CommonChallenge:
                                 except Exception as e:
                                     logger.warning(f"处理图片 {matched_key} 失败: {e}")
 
-                # 在两次识别之间添加随机休眠时间（暂停不计入休眠，停止则干净退出）
-                try:
-                    _sleep_target = random.uniform(1.0, 2.0)
-                except Exception:
-                    _sleep_target = 1.0
-                try:
-                    _sleep_done = pause_aware_sleep(_sleep_target, 0.1)
-                except Exception:
-                    _sleep_done = True
-                if not _sleep_done:
+                # 只有「一张图都没匹配到」时才在这里节流（暂停不计入，停止则干净退出）。
+                # 匹配到图时节奏已由该图的「点击后随机等待」负责，这里不再叠加 ——
+                # 过去写死的 random.uniform(1.0, 2.0) 就是被这一段取代的。
+                if not acted:
                     try:
-                        logger.info("挑战已停止")
+                        _sleep_target = random.uniform(*NO_MATCH_WAIT_RANGE)
                     except Exception:
-                        pass
-                    return False
+                        _sleep_target = NO_MATCH_WAIT_RANGE[0]
+                    try:
+                        _sleep_done = pause_aware_sleep(_sleep_target, 0.1)
+                    except Exception:
+                        _sleep_done = True
+                    if not _sleep_done:
+                        try:
+                            logger.info("挑战已停止")
+                        except Exception:
+                            pass
+                        return False
 
             logger.info(f"挑战完成！共执行{self.times}次挑战")
             
