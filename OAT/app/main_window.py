@@ -50,6 +50,11 @@ from .multi_instance_page import MultiInstancePage
 setup_global_exception_handler()
 
 
+# 「模式」下拉里的占位项（与 home_page 里 setPlaceholderText 的文案一致）。
+# 选中它等于「还没选模式」，此时不该把上次的记忆写掉。
+_PLACEHOLDER_MODE = "请选择模式"
+
+
 class AppUI:
     def __init__(self, window: FluentWindow):
         self.window = window
@@ -197,6 +202,9 @@ class MainWindow(FluentWindow):
         # 启动后台刷新一次客户端列表（进程发现，不阻塞 GUI）；之后每次拉开下拉再刷
         self.refresh_clients_async()
 
+        # 恢复上次的 模式 / 子模式 / 挑战次数（不自动重置）
+        self._restore_mode_selection()
+
     def _connect_page_signals(self):
         self.ui.settings_page.transparency_changed.connect(self.on_transparency_changed)
         self.ui.settings_page.close_program_changed.connect(self.save_close_program_setting)
@@ -214,6 +222,11 @@ class MainWindow(FluentWindow):
     def _connect_main_signals(self):
         self.ui.find_mode_combo.currentTextChanged.connect(self.handle_mode_change)
         self.ui.find_mode_combo.currentIndexChanged.connect(self.ui.on_mode_selected)
+        # 模式 / 子模式 / 挑战次数：一变就记住（下次打开、或刷新后沿用，不自动重置）
+        self.ui.find_mode_combo.currentTextChanged.connect(self._save_mode_selection)
+        self.ui.spinBox.valueChanged.connect(self._save_mode_selection)
+        self.ui.radioButton1.toggled.connect(self._save_mode_selection)
+        self.ui.radioButton2.toggled.connect(self._save_mode_selection)
         self.ui.window_detect_btn.clicked.connect(self.window_detection)
         self.ui.start_challenge_btn.clicked.connect(self.start_challenge)
         self.ui.emergency_stop_btn.clicked.connect(self.emergency_stop)
@@ -354,10 +367,10 @@ class MainWindow(FluentWindow):
         self.update_window_title()
 
     def refresh_window(self):
+        # 只清日志，不动「模式 / 挑战次数」：那两项由 _save/_restore_mode_selection
+        # 记忆，刷新界面不该把它们重置掉（用户要求不自动重置）。
         timestamp = self.log_redirect.get_timestamp()
         self.ui.textBrowser.clear()
-        self.ui.find_mode_combo.setCurrentIndex(0)
-        self.ui.spinBox.setValue(1)
 
         self.ui.textBrowser.append(f"{timestamp} - 窗口已刷新")
         self.log_redirect.print(f"{timestamp} - 窗口已刷新")
@@ -365,6 +378,73 @@ class MainWindow(FluentWindow):
     @staticmethod
     def handle_mode_change(mode: str):
         logger.info(f"选择模式：{mode}")
+
+    # ---------- 模式 / 子模式 / 挑战次数的记忆 ----------
+    # 需求：下次打开、或界面被刷新/重选时沿用上次的选择，不自动重置。
+    # 存在 settings.json（与其它设置同一份），键名统一 last_ 前缀。
+
+    def _current_sub_mode(self) -> str:
+        """当前勾选的子模式（队长/队员这类单选）；没勾返回空串。"""
+        for btn in (getattr(self.ui, "radioButton1", None),
+                    getattr(self.ui, "radioButton2", None)):
+            if btn is not None and btn.isChecked():
+                return btn.text()
+        return ""
+
+    def _save_mode_selection(self, *args):
+        """把当前的 模式/子模式/挑战次数 写进设置。异常绝不影响界面。"""
+        try:
+            mode = self.ui.find_mode_combo.currentText()
+            # 占位项、以及列表被 clear() 清空的瞬间都不写，否则会把上次的记忆冲掉
+            if not mode or mode == _PLACEHOLDER_MODE:
+                return
+            update_settings('last_mode', mode)
+            update_settings('last_sub_mode', self._current_sub_mode())
+            update_settings('last_times', int(self.ui.spinBox.value()))
+        except Exception as e:
+            logger.warning(f"保存模式选择失败: {e}")
+
+    def _restore_mode_selection(self):
+        """恢复上次的模式/子模式/挑战次数；没有记忆就保持默认。
+
+        必须在模式列表加载完、信号连好之后调用：设置 combo 会触发
+        on_mode_selected，子模式单选按钮的文字才就位，之后才能按文字还原勾选。
+        """
+        try:
+            mode = settings_data.get('last_mode') or ""
+            sub_mode = settings_data.get('last_sub_mode') or ""
+            try:
+                times = int(settings_data.get('last_times')) \
+                    if settings_data.get('last_times') is not None else None
+            except (ValueError, TypeError):
+                times = None
+
+            combo = self.ui.find_mode_combo
+            names = [combo.itemText(i) for i in range(combo.count())]
+            if mode and mode in names:
+                combo.setCurrentIndex(names.index(mode))
+                # 子模式：按钮文字由 on_mode_selected 按模式填好，这里按文字还原勾选。
+                # 用 isHidden 而不是 isVisible —— 窗口尚未显示时 isVisible 恒为 False。
+                if sub_mode and not self.ui.soul_land_options.isHidden():
+                    for btn in (self.ui.radioButton1, self.ui.radioButton2):
+                        if not btn.isHidden() and btn.text() == sub_mode:
+                            btn.setChecked(True)
+                            break
+                logger.info("已恢复上次选择：模式={}{}{}".format(
+                    mode,
+                    f"，子模式={sub_mode}" if sub_mode else "",
+                    f"，次数={times}" if times is not None else "",
+                ))
+            elif mode:
+                logger.info(f"上次选的模式「{mode}」已不在模式列表里，保持默认")
+            else:
+                logger.info("没有可恢复的模式选择，保持默认")
+
+            # 挑战次数与模式是否还在无关：只要有记忆就恢复（setValue 会自动夹进范围）
+            if times is not None and times >= 1:
+                self.ui.spinBox.setValue(times)
+        except Exception as e:
+            logger.warning(f"恢复模式选择失败: {e}")
 
     def window_detection(self, *args):
         # 本方法是定时器回调：异常绝不能逃逸出去，否则每一轮都会产生一条
@@ -1213,6 +1293,8 @@ class MainWindow(FluentWindow):
         dialog = ModeEditorDialog(self)
         dialog.exec()
         self.ui.home_page.reload_modes()
+        # 重载会清空下拉、把当前选择丢掉：按记忆恢复回来（模式已被删除则退回默认）
+        self._restore_mode_selection()
         self.ui.on_mode_selected(self.ui.find_mode_combo.currentIndex())
 
     def launch_game_instances(self):
