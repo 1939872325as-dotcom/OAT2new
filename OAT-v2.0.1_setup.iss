@@ -3,7 +3,7 @@
 #define MyAppVersion "2.0.1"
 #define MyAppPublisher "RMA-MUN"
 #define MyAppURL "https://github.com/RMA-MUN/OnmyojiAuto"
-#define MyAppExeName "OAT.exe"          ; 主程序EXE
+#define MyAppExeName "OAT2.exe"          ; 主程序EXE
 #define MyUpdateExeName "OAT_Updater.exe"    ; 更新程序EXE
 
 [Setup]

@@ -60,7 +60,6 @@ class HomePage(QWidget):
         left_layout.setSpacing(12)
 
         self._create_function_area(left_layout)
-        self._create_changelog_area(left_layout)
         left_layout.addStretch()
 
         right_widget = QWidget()
@@ -367,42 +366,6 @@ class HomePage(QWidget):
             QtWidgets.QApplication.clipboard().setText(text)
         except Exception:
             pass
-
-    def _create_changelog_area(self, parent_layout):
-        changelog_card = CardWidget(self)
-        changelog_layout = QVBoxLayout(changelog_card)
-
-        changelog_header = StrongBodyLabel("更新日志")
-        changelog_layout.addWidget(changelog_header)
-
-        self.textBrowser_2 = TextBrowser(self)
-        self.textBrowser_2.setObjectName("changelog_browser")
-        font = QtGui.QFont()
-        font.setPointSize(12)
-        self.textBrowser_2.setFont(font)
-        self.textBrowser_2.setHtml(self.get_text())
-        changelog_layout.addWidget(self.textBrowser_2)
-
-        parent_layout.addWidget(changelog_card)
-
-    def get_text(self):
-        return '''
-            <div style="line-height: 1.0; margin: 0; padding: 0;">
-                <span style="margin: 0;">1.新增 MuMu 模拟器后台模式，最小化窗口后仍能继续执行任务</span>
-                <br style="margin: 0;"/>
-                <span style="margin: 0;">2.同步器支持模拟器客户端</span>
-                <br style="margin: 0;"/>
-                <span style="margin: 0;">3.绘卷刷分接入全局识别好友协助功能</span>
-                <br style="margin: 0;"/>
-                <span style="margin: 0;">4.更新程序完成后可一键启动 OAT</span>
-                <br style="margin: 0;"/>
-                <span style="margin: 0;">5.修复截图冷却永久锁存，一次失败不再永久无响应</span>
-                <br style="margin: 0;"/>
-                <span style="margin: 0;">6.绘卷刷分支持暂停/停止，突破券后台识别</span>
-                <br style="margin: 0;"/>
-                <span style="margin: 0;">7.清理无用代码，补充截图/触摸链路单测</span>
-            </div>
-        '''
 
     def reload_modes(self):
         new_config = mode_config(mode_json_path) or {}

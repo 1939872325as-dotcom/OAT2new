@@ -80,7 +80,6 @@ class AppUI:
         self.start_challenge_btn = self.home_page.start_challenge_btn
         self.emergency_stop_btn = self.home_page.emergency_stop_btn
         self.textBrowser = self.home_page.textBrowser
-        self.textBrowser_2 = self.home_page.textBrowser_2
         self.explore_spin = self.home_page.explore_spin
         self.explore_options = self.home_page.explore_options
 
@@ -118,9 +117,6 @@ class AppUI:
         self.browse_btn = self.multi_instance_page.browse_btn
         self.launch_count = self.multi_instance_page.launch_count
         self.launch_btn = self.multi_instance_page.launch_btn
-
-    def get_text(self):
-        return self.home_page.get_text()
 
     def on_mode_selected(self, index):
         self.home_page.on_mode_selected(index)
@@ -360,8 +356,6 @@ class MainWindow(FluentWindow):
     def refresh_window(self):
         timestamp = self.log_redirect.get_timestamp()
         self.ui.textBrowser.clear()
-        self.ui.textBrowser_2.clear()
-        self.ui.textBrowser_2.setHtml(self.ui.get_text())
         self.ui.find_mode_combo.setCurrentIndex(0)
         self.ui.spinBox.setValue(1)
 

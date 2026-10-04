@@ -1,7 +1,7 @@
 """一键打包：OAT 本体 + OAT 更新程序，然后合并到同一目录。
 
 流程（对标现有手工命令）：
-  1. nuitka 打包 OAT 本体      -> main.dist/（含 OAT.exe）
+  1. nuitka 打包 OAT 本体      -> main.dist/（含 OAT2.exe）
   2. nuitka 打包更新程序        -> <updater-dist>/（含 OAT_Updater.exe）
   3. 合并：先拷 OAT 产物到合并目录，再把更新程序产物叠加上去，
      重名文件直接覆盖（两者同版本依赖，DLL 基本一致；关键是两个 exe 落到同一目录）。
@@ -35,7 +35,7 @@ OAT_CMD = [
     "--enable-plugin=pyqt6",
     "--include-data-dir=OAT/tools/uiResources=OAT/tools/uiResources",
     "--include-data-dir=platforms=platforms",
-    "--output-filename=OAT",
+    "--output-filename=OAT2",
     "main.py",
 ]
 
@@ -53,7 +53,7 @@ UPDATER_CMD = [
 ]
 
 OAT_DIST = os.path.join(ROOT, "main.dist")
-OAT_EXE = "OAT.exe"
+OAT_EXE = "OAT2.exe"
 UPDATER_EXE = "OAT_Updater.exe"
 
 

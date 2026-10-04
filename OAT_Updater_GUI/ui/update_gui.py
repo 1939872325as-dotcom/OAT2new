@@ -22,7 +22,7 @@ except:
 
 
 def resolve_oat_exe(cwd: str, exe_dir: str):
-    """解析 OAT.exe 路径：安装目录（cwd）优先，更新程序自身所在目录兜底。
+    """解析 OAT2.exe 路径：安装目录（cwd）优先，更新程序自身所在目录兜底。
 
     更新程序运行时 cwd 即安装目录（见 UpdateWorker.install_files）；
     打包后 sys.executable 所在目录也是安装目录，双保险。
@@ -31,7 +31,7 @@ def resolve_oat_exe(cwd: str, exe_dir: str):
     for d in (cwd, exe_dir):
         if not d:
             continue
-        cand = os.path.join(d, "OAT.exe")
+        cand = os.path.join(d, "OAT2.exe")
         if os.path.isfile(cand):
             return cand
     return None
@@ -438,7 +438,7 @@ class UpdateGUI(QWidget):
         exe_dir = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.getcwd()
         oat_path = resolve_oat_exe(os.getcwd(), exe_dir)
         if not oat_path:
-            QMessageBox.warning(self, "提示", "未找到 OAT.exe，请手动启动。")
+            QMessageBox.warning(self, "提示", "未找到 OAT2.exe，请手动启动。")
             return
         ok, _pid = QProcess.startDetached(oat_path, [], os.path.dirname(oat_path))
         if not ok:
