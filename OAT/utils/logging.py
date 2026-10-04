@@ -12,9 +12,30 @@ from PyQt6 import QtCore
 from loguru import logger as _lq
 
 # 创建 logs 文件夹
-LOGS_DIR = 'logs'
-if not os.path.exists(LOGS_DIR):
-    os.makedirs(LOGS_DIR)
+#
+# 目录必须【锚定到程序目录】，不能写成相对路径 'logs'。
+# 原因：相对路径是按「进程当前工作目录(CWD)」解析的，于是
+#   · 用快捷方式启动且「起始位置」指向别处，或先 cd 到别的目录再运行 →
+#     日志会落到那个目录下，而不是程序目录；
+#   · 而设置页「清理缓存」是按【程序目录】找 logs/ 的（cache_utils 用 __file__ 推导），
+#     两边一旦不一致，显示的占用和实际日志目录就不是同一个。
+# 这里与 cache_utils._project_root() 用完全相同的推导，保证二者一致。
+def _resolve_logs_dir() -> str:
+    """日志目录：程序根目录下的 logs/；不可写时退回相对路径，避免启动即崩。"""
+    try:
+        root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        d = os.path.join(root, 'logs')
+        os.makedirs(d, exist_ok=True)
+        return d
+    except Exception:
+        try:
+            os.makedirs('logs', exist_ok=True)
+        except Exception:
+            pass
+        return 'logs'
+
+
+LOGS_DIR = _resolve_logs_dir()
 
 # 日志文件：按天轮转（loguru 路径模板，{time} 在 sink 创建/轮转时解析）
 LOG_FILE_PATTERN = os.path.join(LOGS_DIR, 'log_{time:YYYY-MM-DD}.log')
