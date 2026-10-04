@@ -43,6 +43,22 @@ IGNORED_TITLE_SUBSTRINGS = ("MessageWnd",)
 # 游戏窗口所属进程（与窗口标题无关，用户改名后仍可识别）
 MUMU_PROCESS_NAMES = ("MuMuNxDevice.exe", "MuMuPlayer.exe", "NemuPlayer.exe")
 
+# MuMu 未运行时（无进程可反推）的兜底候选：常见安装路径。
+# 仅作最后手段；每一项仍要过 is_mumu_root() 校验，避免把同名目录当安装根。
+COMMON_MUMU_ROOTS = (
+    r"C:\Program Files\Netease\MuMu",
+    r"C:\Program Files (x86)\Netease\MuMu",
+    r"C:\Program Files\Netease\MuMuPlayer-12.0",
+    r"C:\Program Files (x86)\Netease\MuMuPlayer-12.0",
+    r"D:\Program Files\Netease\MuMuPlayer-12.0",
+    r"C:\Program Files\Netease\MuMuPlayer",
+    r"D:\MuMuPlayer",
+    r"D:\MuMuPlayer-12.0",
+    r"E:\MuMuPlayer",
+    r"E:\MuMuPlayer-12.0",
+    r"F:\MuMuPlayer-12.0",
+)
+
 
 @dataclass
 class MumuHandle:
@@ -190,13 +206,105 @@ def _iter_mumu_process_exes() -> list[str]:
     return exes
 
 
+def _roots_from_registry() -> list[str]:
+    """从注册表卸载项读取 MuMu 安装目录 —— 不需要 MuMu 正在运行。
+
+    为什么需要它：原实现只认「运行中的 MuMu 进程」，于是「装了 MuMu 但没启动」
+    时自动识别永远失败（提示还让用户『先启动 MuMu 再试』，对只想配置路径的人很别扭）。
+
+    注册表里有两条名字含 MuMu 的记录：真正的模拟器（InstallLocation 指向安装根）
+    和「阴阳师-MuMu模拟器专版」（指向游戏启动器）。用 is_mumu_root() 校验即可挡住后者。
+    """
+    try:
+        import winreg
+    except Exception:
+        return []
+    hives = [
+        winreg.HKEY_LOCAL_MACHINE,
+        winreg.HKEY_CURRENT_USER,
+    ]
+    subpaths = [
+        r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+        r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+    ]
+    roots: list[str] = []
+    for hive in hives:
+        for sub in subpaths:
+            # 注意：这里不能用 with —— EnumKey 必须在句柄有效的期间调用，
+            # with 一退出句柄就关了，之后枚举会静默报错、一个条目都读不到。
+            try:
+                key = winreg.OpenKey(hive, sub)
+            except OSError:
+                continue
+            try:
+                count = winreg.QueryInfoKey(key)[0]
+                for i in range(count):
+                    try:
+                        name = winreg.EnumKey(key, i)
+                    except OSError:
+                        continue
+                    try:
+                        sk = winreg.OpenKey(hive, sub + "\\" + name)
+                    except OSError:
+                        continue
+                    display = ""
+                    loc = ""
+                    try:
+                        try:
+                            display = str(winreg.QueryValueEx(sk, "DisplayName")[0])
+                        except OSError:
+                            pass
+                        try:
+                            loc = str(winreg.QueryValueEx(sk, "InstallLocation")[0])
+                        except OSError:
+                            pass
+                    finally:
+                        winreg.CloseKey(sk)
+                    blob = (name + display).lower()
+                    if "mumu" not in blob and "nemu" not in blob:
+                        continue
+                    if loc and is_mumu_root(loc) and loc not in roots:
+                        roots.append(loc)
+            finally:
+                winreg.CloseKey(key)
+    return roots
+
+
 def detect_mumu_folder() -> Optional[str]:
-    """从运行中的 MuMu 进程反推安装根目录；无进程或反推失败返回 None。"""
+    """定位 MuMu 安装根目录。
+
+    顺序（前者为准，后者兜底）：
+      1) 运行中的 MuMu 进程反推 —— 最准，且一定是当前在用的那一份；
+      2) 注册表卸载项的 InstallLocation —— 不需要 MuMu 正在运行；
+      3) 常见安装路径 —— 最后手段。
+
+    第 2/3 步是新增的：原来只认进程，导致「装了但没启动」时永远识别失败。
+    """
+    # 1) 进程反推
     for exe in _iter_mumu_process_exes():
         root = _derive_root(exe)
         if root:
+            _log_source(f"运行中的 MuMu 进程（{os.path.basename(exe)}）", root)
             return root
+    # 2) 注册表
+    for root in _roots_from_registry():
+        _log_source("注册表安装记录", root)
+        return root
+    # 3) 常见路径
+    for p in COMMON_MUMU_ROOTS:
+        if is_mumu_root(p):
+            _log_source("常见安装路径", p)
+            return p
     return None
+
+
+def _log_source(source: str, root: str) -> None:
+    """记录识别来源，便于排查「到底认到了哪个 MuMu」。失败不影响主流程。"""
+    try:
+        from OAT.utils.logging import logger
+        logger.info(f"MuMu 安装目录识别：{root}（来源：{source}）")
+    except Exception:
+        pass
 
 
 def _pid_of(hwnd: int) -> int:

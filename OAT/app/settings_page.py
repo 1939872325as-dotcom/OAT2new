@@ -266,8 +266,14 @@ class SettingsPage(QWidget):
         else:
             QtWidgets.QMessageBox.warning(
                 self, "未识别到 MuMu",
-                "未检测到 MuMu 模拟器进程，请先启动 MuMu 模拟器后再试。\n"
-                "也可以点击“选择...”手动指定安装目录。"
+                "没能自动找到 MuMu 安装目录。已依次尝试：\n"
+                "  1. 运行中的 MuMu 进程\n"
+                "  2. 注册表里的安装记录\n"
+                "  3. 常见安装路径\n\n"
+                "如果 MuMu 装在非常规位置，请点击“选择...”手动指定安装目录\n"
+                "（应选到包含 nx_main / nx_device 的那一级，例如\n"
+                "C:\\Program Files\\Netease\\MuMu）。\n\n"
+                "注意：只做桌面版的话不需要这个设置。"
             )
 
     def _create_display_group(self, parent_layout):
