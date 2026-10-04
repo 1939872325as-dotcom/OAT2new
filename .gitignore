@@ -81,7 +81,7 @@ test/find_tupoquan.py
 # AI 助手本地状态目录，不入库
 .superpowers/
 
-# ---- OTA2new 追加：构建产物与运行时文件 ----
+# ---- OAT2new 追加：构建产物与运行时文件 ----
 main.dist/
 main.build/
 platforms/

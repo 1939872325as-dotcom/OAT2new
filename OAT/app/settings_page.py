@@ -18,7 +18,7 @@ from OAT.tools.settings import APP_VERSION, settings_data, update_settings, MUMU
 
 # 软件内展示与更新检查统一指向的仓库地址（改这里即可换仓库）。
 # 上游原项目: https://github.com/RMA-MUN/OnmyojiAuto
-GITHUB_REPO_URL = "https://github.com/1939872325as-dotcom/OTA2new"
+GITHUB_REPO_URL = "https://github.com/1939872325as-dotcom/OAT2new"
 
 
 class SettingsPage(QWidget):

@@ -1,4 +1,4 @@
-# OTA2new
+# OAT2new
 
 <div align="center">
     <img src="https://img.shields.io/badge/version-v2.3.4-blue.svg" alt="Version">
@@ -36,9 +36,9 @@
 
 | 功能 | 链接 |
 | --- | --- |
-| **下载最新打包版（zip）** | [**OTA2new-v2.3.4.zip**](https://github.com/1939872325as-dotcom/OTA2new/releases/download/OTA2new-v2.3.4/OTA2new-v2.3.4.zip) |
-| 查看版本更新内容 | [前往 Releases](https://github.com/1939872325as-dotcom/OTA2new/releases) |
-| 下载源码 | [Download ZIP](https://github.com/1939872325as-dotcom/OTA2new/archive/refs/heads/main.zip) |
+| **下载最新打包版（zip）** | [**OTA2new-v2.3.4.zip**](https://github.com/1939872325as-dotcom/OAT2new/releases/download/OTA2new-v2.3.4/OTA2new-v2.3.4.zip) |
+| 查看版本更新内容 | [前往 Releases](https://github.com/1939872325as-dotcom/OAT2new/releases) |
+| 下载源码 | [Download ZIP](https://github.com/1939872325as-dotcom/OAT2new/archive/refs/heads/main.zip) |
 
 > 与上游一样，**exe 不进仓库**（仓库只放源码），打包版作为 **Release 资源**提供。
 > 下载 zip → 解压 → 运行里面的 `OAT.exe`（建议以**管理员身份**运行）。
@@ -210,7 +210,7 @@
 
 ```bash
 git clone <本仓库地址>
-cd OTA2new
+cd OAT2new
 
 # 方式一：uv（与上游一致）
 uv venv && uv sync

@@ -21,7 +21,7 @@ class UpdateChecker:
     # 若仍指向上游，上游一发新 release 就会提示更新，下载后会把本仓库的修复覆盖掉。
     # 上游原项目: RMA-MUN/OnmyojiAuto
     GITHUB_OWNER = "1939872325as-dotcom"  # 仓库所有人
-    GITHUB_REPO = "OTA2new"  # 仓库名
+    GITHUB_REPO = "OAT2new"  # 仓库名
 
     # 未认证访问 api.github.com 的配额是每 IP 每小时 60 次；曾经每次启动都请求，
     # 连续开关几次程序就会 403 rate limit。这里做 1 小时本地缓存，

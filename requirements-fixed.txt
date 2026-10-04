@@ -1,4 +1,4 @@
-# OTA2new 修正版依赖清单
+# OAT2new 修正版依赖清单
 #
 # 上游 requirements.txt 的问题：
 #   1. numpy == 2.2.6 与 opencv-python == 4.8.0.74 冲突（后者要求 numpy < 2）

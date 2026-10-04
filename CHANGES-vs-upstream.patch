@@ -4,7 +4,7 @@
  # AI 助手本地状态目录，不入库
  .superpowers/
 +
-+# ---- OTA2new 追加：构建产物与运行时文件 ----
++# ---- OAT2new 追加：构建产物与运行时文件 ----
 +main.dist/
 +main.build/
 +platforms/
@@ -104,7 +104,7 @@
 +
 +# 软件内展示与更新检查统一指向的仓库地址（改这里即可换仓库）。
 +# 上游原项目: https://github.com/RMA-MUN/OnmyojiAuto
-+GITHUB_REPO_URL = "https://github.com/1939872325as-dotcom/OTA2new"
++GITHUB_REPO_URL = "https://github.com/1939872325as-dotcom/OAT2new"
  
  
 @@ -178,6 +182,26 @@
@@ -172,7 +172,7 @@
 +    # 若仍指向上游，上游一发新 release 就会提示更新，下载后会把本仓库的修复覆盖掉。
 +    # 上游原项目: RMA-MUN/OnmyojiAuto
 +    GITHUB_OWNER = "1939872325as-dotcom"  # 仓库所有人
-+    GITHUB_REPO = "OTA2new"  # 仓库名
++    GITHUB_REPO = "OAT2new"  # 仓库名
 +
 +    # 未认证访问 api.github.com 的配额是每 IP 每小时 60 次；曾经每次启动都请求，
 +    # 连续开关几次程序就会 403 rate limit。这里做 1 小时本地缓存，
@@ -2472,7 +2472,7 @@
 +++ b/README.md
 @@ -1,195 +1,200 @@
 -# OnmyojiAuto - 阴阳师自动化
-+# OTA2new
++# OAT2new
  
  <div align="center">
 -    <img src="https://img.shields.io/badge/version-v2.3.3-blue.svg" alt="Version">
@@ -2677,7 +2677,7 @@
 -git clone https://github.com/RMA-MUN/OnmyojiAuto.git
 -cd OnmyojiAuto
 +git clone <本仓库地址>
-+cd OTA2new
++cd OAT2new
 +
 +# 方式一：uv（与上游一致）
 +uv venv && uv sync
