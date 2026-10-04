@@ -17,8 +17,11 @@ class UpdateChecker:
 
     # 版本相关常量
     CURRENT_VERSION = f"{APP_VERSION}"  # 当前版本，不允许修改，用于检查是否更新
-    GITHUB_OWNER = "RMA-MUN"  # 仓库所有人
-    GITHUB_REPO = "OnmyojiAuto"  # 仓库名
+    # 更新检查指向本仓库。这是修改版（fork），必须检查自己的仓库：
+    # 若仍指向上游，上游一发新 release 就会提示更新，下载后会把本仓库的修复覆盖掉。
+    # 上游原项目: RMA-MUN/OnmyojiAuto
+    GITHUB_OWNER = "1939872325as-dotcom"  # 仓库所有人
+    GITHUB_REPO = "OTA2new"  # 仓库名
 
     # 未认证访问 api.github.com 的配额是每 IP 每小时 60 次；曾经每次启动都请求，
     # 连续开关几次程序就会 403 rate limit。这里做 1 小时本地缓存，
@@ -46,10 +49,18 @@ class UpdateChecker:
         return os.path.join(os.path.dirname(os.path.abspath(__file__)), 'update_cache.json')
 
     def _read_cache(self):
-        """读取缓存的 release 信息，返回 (info, fetched_at)；无缓存返回 (None, 0)"""
+        """读取缓存的 release 信息，返回 (info, fetched_at)；无缓存返回 (None, 0)
+
+        缓存里记了它属于哪个 owner/repo：换仓库后旧缓存必须失效，
+        否则会把上一个仓库的 release 当成当前仓库的（例如从上游切到自己的
+        fork 后，仍提示上游那个版本，甚至引导去下载上游包覆盖本地修改）。
+        """
         try:
             with open(self._cache_path, 'r', encoding='utf-8') as f:
                 cache = json.load(f)
+            # 兼容旧格式（没有 owner/repo 字段）：一律视为无效，宁可重新请求
+            if cache.get('owner') != self.owner or cache.get('repo') != self.repo:
+                return None, 0.0
             info = cache.get('info')
             fetched_at = float(cache.get('fetched_at', 0))
             if isinstance(info, dict):
@@ -61,7 +72,9 @@ class UpdateChecker:
     def _write_cache(self, info: dict) -> None:
         try:
             with open(self._cache_path, 'w', encoding='utf-8') as f:
-                json.dump({'fetched_at': time.time(), 'info': info}, f, ensure_ascii=False)
+                json.dump({'fetched_at': time.time(),
+                           'owner': self.owner, 'repo': self.repo,
+                           'info': info}, f, ensure_ascii=False)
         except Exception as e:
             logger.warning(f"写入更新缓存失败（不影响本次检查）: {e}")
 

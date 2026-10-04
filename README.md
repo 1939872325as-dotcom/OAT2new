@@ -89,7 +89,7 @@
 
 | 文件 | 改动 |
 | --- | --- |
-| `OAT/config/check_update.py` | 加 **1 小时本地缓存**（未认证访问 `api.github.com` 仅 60 次/小时，原来每次启动都请求，开关几次就 403）；403/解析失败降级为 warning 并回退缓存；新增 `last_error` 让「检查失败」与「已是最新」可区分；`except KeyError`（永远进不来）改为显式 `json.JSONDecodeError` 并**放在 `RequestException` 之前**（`requests` 的 JSONDecodeError 同时继承两个基类，顺序放错会被吃掉）；版本号解析健壮化；**去掉 `verify=False`**（自更新会下载并执行 zip，走未校验 TLS 是供应链风险） |
+| `OAT/config/check_update.py` | **更新检查改指本仓库**（对 fork 是必须的：继续指上游会把本地修复覆盖掉）；缓存带上 `owner`/`repo`，换仓库后旧缓存自动失效；加 **1 小时本地缓存**（未认证访问 `api.github.com` 仅 60 次/小时，原来每次启动都请求，开关几次就 403）；403/解析失败降级为 warning 并回退缓存；新增 `last_error` 让「检查失败」与「已是最新」可区分；`except KeyError`（永远进不来）改为显式 `json.JSONDecodeError` 并**放在 `RequestException` 之前**（`requests` 的 JSONDecodeError 同时继承两个基类，顺序放错会被吃掉）；版本号解析健壮化；**去掉 `verify=False`**（自更新会下载并执行 zip，走未校验 TLS 是供应链风险） |
 | `OAT/config/update_manager.py` | 去掉 `verify=False`（×3）与告警抑制；`logger.warn` → `logger.warning` |
 
 #### 5. 模式 / 图像编辑器
@@ -97,7 +97,7 @@
 | 文件 | 改动 |
 | --- | --- |
 | `OAT/tools/edit_mode_and_img.py` | 新增 **「截图添加」**、**「截图替换」** 两个按钮（截图替换=选中一张图直接框选覆盖，文件名与配置不变）；「OCR配置」新增 **「OCR搜索区域」** 输入框；「点击区域设置」新增 **「点击后随机等待(秒)」**；配置正/反向转换保留 `ocr_region` 与等待字段；新增 `_normalize_area` / `_normalize_wait`（同时兼容 list 与 str，否则从 config.json 读出的 list 会被当成非法而静默丢弃） |
-| `OAT/app/settings_page.py` | 「清理缓存」卡片**显示当前占用体积**（分项展示），切到设置页与清理完成后自动刷新 |
+| `OAT/app/settings_page.py` | 「GitHub 仓库」超链接**指向本仓库**（顺带修掉上游笔误 —— 原链接 `RMA-MUN/Onmyou**u**jiAuto` 多一个 u，是坏链接）；「清理缓存」卡片**显示当前占用体积**（分项展示），切到设置页与清理完成后自动刷新 |
 
 #### 6. 打包 / 运行
 

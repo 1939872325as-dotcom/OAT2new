@@ -1,3 +1,21 @@
+--- a/.gitignore
++++ b/.gitignore
+@@ -81,2 +81,14 @@
+ # AI 助手本地状态目录，不入库
+ .superpowers/
++
++# ---- OTA2new 追加：构建产物与运行时文件 ----
++main.dist/
++main.build/
++platforms/
++__pycache__/
++*.pyc
++*.pyo
++*.pyd
++*.log
++logs/
++config/update_cache.json
+
 --- a/OAT/app/main_window.py
 +++ b/OAT/app/main_window.py
 @@ -374,18 +374,24 @@
@@ -80,7 +98,16 @@
 
 --- a/OAT/app/settings_page.py
 +++ b/OAT/app/settings_page.py
-@@ -178,6 +178,26 @@
+@@ -16,4 +16,8 @@
+ 
+ from OAT.tools.settings import APP_VERSION, settings_data, update_settings, MUMU_FOLDER
++
++# 软件内展示与更新检查统一指向的仓库地址（改这里即可换仓库）。
++# 上游原项目: https://github.com/RMA-MUN/OnmyojiAuto
++GITHUB_REPO_URL = "https://github.com/1939872325as-dotcom/OTA2new"
+ 
+ 
+@@ -178,6 +182,26 @@
          self.clear_cache_button = self.clear_cache_card.button
          group.addSettingCard(self.clear_cache_card)
 +        self.refresh_cache_size()
@@ -107,6 +134,17 @@
 +        self.refresh_cache_size()
  
      def _create_emulator_group(self, parent_layout):
+@@ -391,8 +415,8 @@
+ 
+         github_card = HyperlinkCard(
+-            "https://github.com/RMA-MUN/OnmyoujiAuto",
++            GITHUB_REPO_URL,
+             "前往 GitHub", FIF.GITHUB,
+             "GitHub 仓库",
+-            "如果您觉得本工具对您有帮助，在Github给个star支持一下！",
++            "本仓库是 OAT 的修改版，原项目：RMA-MUN/OnmyojiAuto",
+             self
+         )
 
 --- a/OAT/config/check_update.py
 +++ b/OAT/config/check_update.py
@@ -120,7 +158,7 @@
 -from urllib3.exceptions import InsecureRequestWarning
  
  from OAT.tools.settings import APP_VERSION
-@@ -12,7 +16,4 @@
+@@ -12,11 +16,16 @@
      """
  
 -    # 禁用不安全请求警告
@@ -128,17 +166,21 @@
 -
      # 版本相关常量
      CURRENT_VERSION = f"{APP_VERSION}"  # 当前版本，不允许修改，用于检查是否更新
-@@ -20,4 +21,9 @@
-     GITHUB_REPO = "OnmyojiAuto"  # 仓库名
- 
+-    GITHUB_OWNER = "RMA-MUN"  # 仓库所有人
+-    GITHUB_REPO = "OnmyojiAuto"  # 仓库名
++    # 更新检查指向本仓库。这是修改版（fork），必须检查自己的仓库：
++    # 若仍指向上游，上游一发新 release 就会提示更新，下载后会把本仓库的修复覆盖掉。
++    # 上游原项目: RMA-MUN/OnmyojiAuto
++    GITHUB_OWNER = "1939872325as-dotcom"  # 仓库所有人
++    GITHUB_REPO = "OTA2new"  # 仓库名
++
 +    # 未认证访问 api.github.com 的配额是每 IP 每小时 60 次；曾经每次启动都请求，
 +    # 连续开关几次程序就会 403 rate limit。这里做 1 小时本地缓存，
 +    # 启动阶段直接读缓存，避免打满配额。
 +    CACHE_TTL_SECONDS = 3600
-+
+ 
      def __init__(self, owner: str = None, repo: str = None, current_version: str = CURRENT_VERSION):
-         """
-@@ -31,11 +37,46 @@
+@@ -31,11 +40,56 @@
          self.repo = repo if repo else self.GITHUB_REPO
          self.current_version = current_version if current_version else self.CURRENT_VERSION
 -
@@ -153,10 +195,18 @@
 +        return os.path.join(os.path.dirname(os.path.abspath(__file__)), 'update_cache.json')
 +
 +    def _read_cache(self):
-+        """读取缓存的 release 信息，返回 (info, fetched_at)；无缓存返回 (None, 0)"""
++        """读取缓存的 release 信息，返回 (info, fetched_at)；无缓存返回 (None, 0)
++
++        缓存里记了它属于哪个 owner/repo：换仓库后旧缓存必须失效，
++        否则会把上一个仓库的 release 当成当前仓库的（例如从上游切到自己的
++        fork 后，仍提示上游那个版本，甚至引导去下载上游包覆盖本地修改）。
++        """
 +        try:
 +            with open(self._cache_path, 'r', encoding='utf-8') as f:
 +                cache = json.load(f)
++            # 兼容旧格式（没有 owner/repo 字段）：一律视为无效，宁可重新请求
++            if cache.get('owner') != self.owner or cache.get('repo') != self.repo:
++                return None, 0.0
 +            info = cache.get('info')
 +            fetched_at = float(cache.get('fetched_at', 0))
 +            if isinstance(info, dict):
@@ -168,7 +218,9 @@
 +    def _write_cache(self, info: dict) -> None:
 +        try:
 +            with open(self._cache_path, 'w', encoding='utf-8') as f:
-+                json.dump({'fetched_at': time.time(), 'info': info}, f, ensure_ascii=False)
++                json.dump({'fetched_at': time.time(),
++                           'owner': self.owner, 'repo': self.repo,
++                           'info': info}, f, ensure_ascii=False)
 +        except Exception as e:
 +            logger.warning(f"写入更新缓存失败（不影响本次检查）: {e}")
 +
@@ -187,7 +239,7 @@
 +
          api_url = f"https://api.github.com/repos/{self.owner}/{self.repo}/releases/latest"
          headers = {
-@@ -45,8 +86,12 @@
+@@ -45,8 +99,12 @@
  
          try:
 -            response = requests.get(api_url, headers=headers, verify=False, timeout=10)
@@ -204,7 +256,7 @@
 +                return cached_info
  
              response.raise_for_status()  # 检查请求是否成功
-@@ -54,12 +99,19 @@
+@@ -54,12 +112,19 @@
              # 尝试解析JSON
              info = response.json()
 +            self.last_error = None
@@ -229,21 +281,21 @@
 +            return cached_info
  
      @staticmethod
-@@ -71,5 +123,5 @@
+@@ -71,5 +136,5 @@
          :return: tag name字符串，如果未找到则返回None
          """
 -        return info.get("tag_name")
 +        return (info or {}).get("tag_name")
  
      @staticmethod
-@@ -81,5 +133,5 @@
+@@ -81,5 +146,5 @@
          :return: 更新描述字符串，如果未找到则返回None
          """
 -        return info.get("body")
 +        return (info or {}).get("body")
  
      @staticmethod
-@@ -91,9 +143,22 @@
+@@ -91,9 +156,22 @@
          :return: 版本号数字列表，例如 [1, 5, 4]
          """
 +        if not version:
@@ -270,7 +322,7 @@
 +        return parts
  
      def latest_version(self) -> str | None:
-@@ -108,4 +173,18 @@
+@@ -108,4 +186,18 @@
          return None
  
 +    def has_update(self) -> bool:
@@ -289,7 +341,7 @@
 +
      def check_update(self) -> bool:
          """
-@@ -114,14 +193,5 @@
+@@ -114,14 +206,5 @@
          :return: 如果需要更新则返回True，否则返回False
          """
 -        info = self.get_latest_release_info()
@@ -305,7 +357,7 @@
 +        return self.has_update()
  
  
-@@ -132,15 +202,4 @@
+@@ -132,15 +215,4 @@
      # 获取最新版本信息
      latest_info = checker.get_latest_release_info()
 -
@@ -2415,6 +2467,410 @@
 +                self._cache[cache_key] = (result, current_time, self.last_match_confidence)
              
              return result
+
+--- a/README.md
++++ b/README.md
+@@ -1,195 +1,200 @@
+-# OnmyojiAuto - 阴阳师自动化
++# OTA2new
+ 
+ <div align="center">
+-    <img src="https://img.shields.io/badge/version-v2.3.3-blue.svg" alt="Version">
++    <img src="https://img.shields.io/badge/version-v2.3.4-blue.svg" alt="Version">
+     <img src="https://img.shields.io/badge/system-Windows-blue.svg" alt="System">
+-    <img src="https://img.shields.io/badge/python-v3.12.4-blue.svg" alt="System">
++    <img src="https://img.shields.io/badge/python-v3.12-blue.svg" alt="Python">
++    <img src="https://img.shields.io/badge/license-GPL--3.0-green.svg" alt="License">
+ </div>
+ 
+-
+-
+-
+-
+-
+-
+----
+-
+-## 📥 程序下载 & 更新日志
+-
+-| 功能              | 链接                                                         |
+-| ----------------- | :----------------------------------------------------------- |
+-| 下载最新exe压缩包 | [立即下载](https://github.com/RMA-MUN/OnmyojiAuto/releases/download/OAT-v2.3.3/OAT-v2.3.3.zip) |
+-| 查看版本更新内容  | [前往查看](https://github.com/RMA-MUN/OnmyojiAuto/releases/latest) |
+-
+----
+-
+-## 📸 程序截图
+-
+-|                        运行截图                        |
+-| :----------------------------------------------------: |
+-|           ![运行图片](./img_pages/home.png)            |
+-|                同步器和窗口预览功能展示                |
+-| ![同步器和窗口预览功能展示](./img_pages/sync_page.png) |
+-|                        设置页面                        |
+-|        ![背景图片](./img_pages/background.png)         |
+-
+----
+-
+-## 📌 项目简介
+-
+-OnmyojiAuto是一款基于Python开发的阴阳师游戏自动化辅助工具，通过计算机视觉技术实现游戏内的图像识别与自动点击，帮助玩家完成各类副本任务。工具支持多窗口同步操作，配备直观的GUI界面，降低使用门槛。
+-
+----
+-
+-## ✨ 功能特性
+-
+-- **🖥️ 多客户端支持**：兼容阴阳师桌面版与MuMu模拟器
+-- **🎯 丰富副本覆盖**：支持魂土、魂王、业原火、觉醒、爬塔（门票/体力）、灵染试炼、御灵、契灵探查等多种副本
+-- **🎨 便捷操作体验**：图形化界面（GUI）设计，支持模式选择、次数设置等可视化操作
+-- **🔄 多窗口协同**：支持桌面版窗口同步功能，可实现主窗口操作同步至副窗口
+-- **🎮 后台运行模式**：可选择后台运行，不占用鼠标和屏幕(后台运行仅支持桌面版)
+-
+----
+-
+-## 🛠️ 源码运行步骤(需要python和git环境,非开发者不推荐)
+-
+-### 1. 克隆仓库
++<div align="center">
++    <b>阴阳师自动化工具 · 基于上游 <a href="https://github.com/RMA-MUN/OnmyojiAuto">RMA-MUN/OnmyojiAuto</a> 的修改版</b>
++</div>
++
++---
++
++## 📍 上游地址
++
++| 项目 | 地址 / 说明 |
++| --- | --- |
++| **上游仓库** | <https://github.com/RMA-MUN/OnmyojiAuto> |
++| **上游作者** | RMA-MUN（邮箱 n3032747608@163.com） |
++| **本项目基线** | 上游 `main` 分支（代码版本 **v2.3.4**） |
++| **上游最新 release** | `OAT-v2.3.3`（2026-09-25） |
++| **许可证** | [GNU GPL v3.0](./LICENSE) |
++
++> **说明**：上游 v2.3.3 的 release 包与 `main` 分支之间还有若干提交（版本号、多开客户端标签修复等）。
++> 本项目直接以 `main` 为基线，因此**已经包含 v2.3.4 的全部上游改动**，再叠加下述修复与新增功能。
++
++本仓库是上游的衍生作品（derivative work），按 GPL-3.0 要求：
++**保留原许可证、注明来源、并以相同许可证开源**。上游原始 README 保留在
++[README-upstream.md](./README-upstream.md)。
++
++---
++
++## 🎯 本仓库相对上游做了什么
++
++上游工具本身可用，但在「后台点击 + 多模式 + 长时间挂机」这条路上有一批**静默失败**型缺陷：
++日志显示「挑战完成」，游戏里却没点；或计数被误判成卡死而提前中止。
++本项目把这些缺陷逐条定位修掉，并新增了几个实用功能。
++
++**改动规模：18 个文件改写、3 个文件新增，约 +1300 / −300 行。**
++
++完整 unified diff 见 👉 [**CHANGES-vs-upstream.patch**](./CHANGES-vs-upstream.patch)
++（以「上游 main」为 `a/`、本仓库为 `b/`）。逐条说明见 [docs/变更明细.md](./docs/变更明细.md)。
++
++---
++
++## ✨ 相对上游的变更清单
++
++### 一、新增文件（3）
++
++| 文件 | 作用 |
++| --- | --- |
++| `OAT/tools/region_capture.py` | **飞书式框选截图**：贴住游戏窗口、1:1 原始像素、后台抓图（PrintWindow），框选即得模板。截出来的尺寸**就是识别时用的客户区尺寸**，从根上避免「模板在 A 尺寸截、运行时 B 尺寸」导致的匹配失败 |
++| `OAT/utils/cache_utils.py` | **缓存占用统计**：算出「清理缓存」实际会清掉多少体积，与清理逻辑共用同一批路径 |
++| `_nuitka_deps.py` | Nuitka 打包用的依赖收集（导入语句集中在一个不会被调用的函数里，规避 Nuitka 顶层导入崩溃） |
++
++### 二、修改文件（18）
++
++#### 1. 崩溃 / 句柄失效类
++
++| 文件 | 改动 |
++| --- | --- |
++| `OAT/tools/WindowChecker.py` | 新增 `_resolve_hwnd()`：缓存句柄先用 `IsWindow()` 校验，失效则按标题重找。`GetWindowRect`/`GetClientRect` 包异常，窗口消失时返回 `None` 而不再抛 `(1400, '无效的窗口句柄')`；**区分外框与客户区尺寸**，`resize_window` 改按客户区语义（`AdjustWindowRectEx` 换算）、调整后轮询等待生效再复测 |
++| `OAT/app/main_window.py` | 窗口检测定时器回调整体兜底，异常不再逃逸；清理缓存后刷新占用显示；`logger.warn` → `logger.warning` |
++| `OAT/source/huijuanshuafen/{base,explore,huijuan}.py` | 截图失败时空图保护（不再 `shot.shape` 报 AttributeError）；k28 用显式阈值；突破阶段被停止/失败时不再白等 5 分钟收尾；`logger.warn` → `logger.warning` |
++| `OAT/source/__init__.py` | 模式无法启动时**弹窗提示并列出可用模式**（原来只写一条 ERROR 日志，界面表现是「点了开始没反应」）；字典模式缺 `default` 键时不再 `KeyError` |
++
++#### 2. OCR 点错位置（一个页面有两处相同文字）
++
++| 文件 | 改动 |
++| --- | --- |
++| `OAT/tools/OCRManager.py` | `find_text_offline()` 改为**收集全部候选 → 完全相等优先 → 达阈值者优先 → 置信度最高者**（原来命中第一个就 `break`）；新增 `region` 参数；命中多处时把每一处的文字/置信度/坐标写进日志 |
++| `OAT/utils/OCRService.py` | `confidence_threshold` / `region` 真正透传（原来阈值从未传下去，配置里那个 0.8 是摆设）；**修掉缓存键缺陷**——原来对 numpy 图固定用 `image:{目标文字}`、不含图像内容，换帧后仍返回上一帧坐标；改为 64×64 降采样指纹做键 |
++| `OAT/tools/OnmyojiAuto.py` | 新增 `ocr_region` / `ocr_confidence_threshold`；先算「截图坐标→客户区坐标」偏移 `dy`，再把客户区描述的 `ocr_region` 换算成截图坐标后裁剪 |
++
++> **`click_area` / `ocr_region` 的真实语义是 `[x1, x2, y1, y2]`（两个区间），不是官方说明里的 `[左, 上, 宽, 高]`。**
++> 依据是 `OnmyojiAuto.py` 里的 `x1, x2, y1, y2 = click_area`。
++
++#### 3. MAA 管道模式（「显示挑战完成但根本没点」）
++
++| 文件 | 改动 |
++| --- | --- |
++| `OAT/pipeline/runner.py` | ① `_resolve_click_coords` 无法确定坐标时返回 `None` 并跳过点击（原来静默返回 `(0,0)`，点到窗口左上角）；② 主循环取错任务——`current_next` 已被改成「它的 next」，导致 `is_start` 判错、且 `next` 为空时 `_task_map[None]` **KeyError 直接把挑战打成致命错误**；③ 新增「某任务的 next 曾超时、之后它自己又匹配到」的告警；④ 详细日志；⑤ **每张图独立的点击后随机等待** |
++| `OAT/pipeline/recognition_opencv.py` | `find_text` **真正使用 `confidence`** 并回填真实置信度（原来不传阈值、不填置信度，日志必然显示 `0.00`）；新增 `region` 支持；模板未达阈值时打印「最高分 / 阈值 / 最佳位置 / 模板与截图尺寸」 |
++| `OAT/pipeline/task_definition.py` | 新增 `ocr_region`、`click_wait_min`、`click_wait_max` 字段与解析 |
++
++#### 4. 更新检查
++
++| 文件 | 改动 |
++| --- | --- |
++| `OAT/config/check_update.py` | 加 **1 小时本地缓存**（未认证访问 `api.github.com` 仅 60 次/小时，原来每次启动都请求，开关几次就 403）；403/解析失败降级为 warning 并回退缓存；新增 `last_error` 让「检查失败」与「已是最新」可区分；`except KeyError`（永远进不来）改为显式 `json.JSONDecodeError` 并**放在 `RequestException` 之前**（`requests` 的 JSONDecodeError 同时继承两个基类，顺序放错会被吃掉）；版本号解析健壮化；**去掉 `verify=False`**（自更新会下载并执行 zip，走未校验 TLS 是供应链风险） |
++| `OAT/config/update_manager.py` | 去掉 `verify=False`（×3）与告警抑制；`logger.warn` → `logger.warning` |
++
++#### 5. 模式 / 图像编辑器
++
++| 文件 | 改动 |
++| --- | --- |
++| `OAT/tools/edit_mode_and_img.py` | 新增 **「截图添加」**、**「截图替换」** 两个按钮（截图替换=选中一张图直接框选覆盖，文件名与配置不变）；「OCR配置」新增 **「OCR搜索区域」** 输入框；「点击区域设置」新增 **「点击后随机等待(秒)」**；配置正/反向转换保留 `ocr_region` 与等待字段；新增 `_normalize_area` / `_normalize_wait`（同时兼容 list 与 str，否则从 config.json 读出的 list 会被当成非法而静默丢弃） |
++| `OAT/app/settings_page.py` | 「清理缓存」卡片**显示当前占用体积**（分项展示），切到设置页与清理完成后自动刷新 |
++
++#### 6. 打包 / 运行
++
++| 文件 | 改动 |
++| --- | --- |
++| `main.py` | **热更新启动器**：冻结运行时优先把「exe 同目录的磁盘源码」放进 `sys.path` 最前，使业务代码（`OAT/`）改动后**无需重新编译**即可生效 |
++| `OAT/tools/settings.py` | 版本号 `2.3.4` |
++| `OAT/source/common_challenge.py` | 删掉**跨图共享**的 `retry_count`（原来任何图片命中都自增，某张图触发过一次「连续 2 次」后，之后任意 5 次匹配就把整个挑战判为卡死并中止）；修掉 `NameError` 被裸 `except` 静默吞掉导致的「切图重置计数」失效；新增 `_build_recognition_order()` **真正读取 `recognition_order`**（此前该字段无任何代码读取，识别顺序退化成 JSON 键序）；两处裸 `except` 改为记录 warning |
++
++### 三、差异汇总（+行 / −行）
++
++| 文件 | + | − |
++| --- | ---: | ---: |
++| `OAT/tools/edit_mode_and_img.py` | 345 | 3 |
++| `OAT/tools/WindowChecker.py` | 219 | 40 |
++| `OAT/pipeline/runner.py` | 141 | 22 |
++| `OAT/config/check_update.py` | 101 | 42 |
++| `OAT/tools/OCRManager.py` | 66 | 40 |
++| `OAT/source/common_challenge.py` | 62 | 52 |
++| `main.py` | 58 | 0 |
++| `OAT/pipeline/recognition_opencv.py` | 52 | 8 |
++| `OAT/tools/OnmyojiAuto.py` | 43 | 22 |
++| `OAT/app/main_window.py` | 35 | 17 |
++| `OAT/pipeline/task_definition.py` | 32 | 0 |
++| `OAT/source/huijuanshuafen/huijuan.py` | 31 | 24 |
++| `OAT/utils/OCRService.py` | 31 | 8 |
++| `OAT/source/__init__.py` | 21 | 1 |
++| `OAT/app/settings_page.py` | 20 | 0 |
++| `OAT/source/huijuanshuafen/explore.py` | 13 | 13 |
++| `OAT/source/huijuanshuafen/base.py` | 9 | 5 |
++| `OAT/config/update_manager.py` | 7 | 10 |
++
++---
++
++## ⚠️ 重要：一个行为变更
++
++上一节 `WindowChecker` 的修复**改变了窗口尺寸的语义**：
++
++- **修复后**：「客户区」（真正的游戏画面区域）才等于配置里的 `custom_res_width/height`（如 1404×834）。
++- **上游原版**：`SetWindowPos` 收到的是客户区目标却被当作**外框**尺寸使用，且用外框和客户区目标比较，
++  于是永远不相等、每次点「窗口检测」尺寸都漂移。
++
++**因此：升级到本版本后，原先按旧尺寸截的模板图需要按新的客户区尺寸重新截取。**
++用新增的「截图添加 / 截图替换」按钮重截最方便，它抓的就是客户区、与识别坐标系一致。
++
++---
++
++## 🛠️ 构建 / 运行
++
++### 源码运行
+ 
+ ```bash
+-git clone https://github.com/RMA-MUN/OnmyojiAuto.git
+-cd OnmyojiAuto
++git clone <本仓库地址>
++cd OTA2new
++
++# 方式一：uv（与上游一致）
++uv venv && uv sync
++python main.py
++
++# 方式二：pip（注意依赖版本坑，见下）
++pip install -r requirements-fixed.txt
++python main.py
+ ```
+ 
+-### 2. 安装依赖
+-
+-使用uv包管理器安装项目依赖（推荐使用uv进行包管理，速度更快且更稳定）：
+-
+-#### 安装uv（如果尚未安装）
++### 依赖说明（重要）
++
++上游 `requirements.txt` 存在**版本冲突与缺失**，直接用会装不上或运行报错：
++
++- `numpy == 2.2.6` 与 `opencv-python == 4.8.0.74` 不兼容（后者要求 numpy < 2）
++- 缺少 `loguru`、`qfluentwidgets`、`rapidocr`、`onnxruntime`
++- `pyyaml` 重复声明两次；`pillow == 9.5.0` 与 numpy 2.x 冲突
++
++本仓库**保留了上游的 `requirements.txt` 原样**，另附一份实测可用的
++[`requirements-fixed.txt`](./requirements-fixed.txt)（Python 3.12）：
++
+ ```bash
+-pip install uv
++pip install -r requirements-fixed.txt
+ ```
+ 
+-#### 使用uv创建虚拟环境并安装依赖
++### 打包
++
++上游用 **Nuitka**（不是 PyInstaller）：
++
+ ```bash
+-# 创建并激活虚拟环境
+-uv venv
+-uv venv activate
+-
+-# 安装项目依赖
+-uv sync
++python build_release.py
+ ```
+ 
+-**核心依赖说明**：
+-- `opencv-python`：图像识别
+-- `PyQt6`：GUI界面开发
+-- `pywin32`：Windows窗口控制
+-- `rapidocr`：文字识别
+-- `numpy`：数值计算
+-- `requests`：网络请求
+-
+-### 3. 环境配置
+-
+-- ✅ 推荐使用**阴阳师桌面版**([下载链接](https://adl.netease.com/d/g/a11/c/yx_yys))
+-- ✅ 确保程序以**管理员身份**运行
+-- ✅ 如不启用后台模式，请保证窗口可见
+-
+----
+-
+-## 🚀 使用指南
+-
+-### 基本操作
+-
+-1. **启动程序**：
+-   
+-   ```bash
+-   python main.py
+-   ```
+-   
+-2. **配置客户端**：
+-    - 选择客户端类型（推荐阴阳师桌面版）
+-    - 如需自定义客户端，可在`client.json`中添加
+-
+-3. **选择副本模式**：
+-   
+-    - 选择目标副本（如"魂土"、"爬塔"等）
+-    - 部分模式需选择子模式（如魂土的"队长"或"队员"）
+-    - 可在`OAT/source/mode.json`中添加和修改模式配置
+-    
+-4. **设置挑战参数**：
+-
+-    - 设置挑战次数（1-10000次）
+-    - 点击"窗口检测"确认游戏窗口识别正常
+-
+-5. **选择运行模式**：
+-    - 根据需求选择不同的客户端
+-    - 选择是否启用后台运行模式
+-
+-6. **启动任务**：
+-    - 点击"开始挑战"启动自动化任务
+-    - 可通过"紧急停止"强行退出程序
+-
+----
+-
+-## 🔄 多窗口同步功能
+-
+-### 使用步骤
+-
+-1. **刷新窗口**：点击"刷新窗口"按钮获取当前所有符合条件的窗口列表
+-    - 如需自定义窗口标题，可在`client.json`文件中配置
+-
+-2. **选择窗口**：在表格中勾选需要参与同步的窗口
+-
+-3. **设置主副窗口**：
+-    - 选择一个窗口并点击"设置主窗口"（作为操作源）
+-    - 选择一个或多个窗口并点击"设置副窗口"（跟随主窗口操作）
+-
+-4. **窗口排列**：点击"窗口排列"按钮，系统会自动排列所有选择的窗口
+-
+-5. **同步控制**：
+-    - 点击"开始同步"按钮启动同步功能
+-    - 点击"停止同步"按钮停止同步功能
+-
+-### 注意事项
+-
+-- ⚠️ 主窗口只能设置一个
+-- ⚠️ 副窗口至少设置一个
+-- ⚠️ 开始同步前请确保已正确设置主窗口和副窗口
+-- ⚠️ 同步过程中请勿关闭主窗口
+-- ⚠️ 如需调整同步窗口，建议先停止同步
+-
+----
+-
+-## ⚠️ 注意事项
+-
+-1. 📐 确保游戏窗口分辨率稳定，避免窗口缩放导致识别偏移
+-2. 💻 程序仅支持Windows操作系统(测试环境：1920*1080分辨率下，125%的缩放。)
+-3. 📝 本工具仅用于学习交流，如需对本程序进行修改，修改后的源代码必须采取GNU协议开源
+-
+----
+-
+-## ❓ 常见问题
+-
+-### Q: 窗口识别失败怎么办？
+-A: 如果窗口标题不匹配，可在`client.json`中修改窗口标题部分。
+-
+-### Q: 图片识别错误如何解决？
+-A: 验证`source`目录下对应副本的图片资源是否匹配当前游戏版本，可重新截图替换并保持对应文件名。引起识别错误的原因可能是预设图片与实际使用图片不符或设备分辨率不同，建议自行截图替换。
+-
+-### Q: 多窗口同步失效如何处理？
+-A: 确认主窗口和副窗口均已正确选择，主窗口需一直可见，副窗口可以最小化，但需确保主副窗口大小不变。
+-
+-### Q: 窗口检测与执行挑战无效怎么办？
+-A: 确保本程序以管理员身份运行，确保窗口大小不变且可见。
+-
+-### Q：点击开始挑战之后，没有报错也没有反应怎么办？
+-A：右键游戏程序，选择属性，兼容性，更改更高DPI设置，勾选替换高DPI缩放行为，然后点击确认和应用。重启游戏即可
+-
+-
+-
+----
+-
+-<div align="center">
+-    <p>✨ 如还有问题或建议，欢迎提交 Issue ✨</p>
+-</div>
++本仓库的 `main.py` 支持**热更新**打包方式：用
++`--nofollow-import-to=OAT` 编译 exe，业务代码留在磁盘上，改动后不必重新编译。
++
++---
++
++## 📄 文档
++
++- [变更明细（逐条修复说明）](./docs/变更明细.md)
++- [操作指引 · 配置与截图逻辑](./docs/操作指引-配置与截图逻辑.md)
++- [操作指引 · 模式与图片编辑（新手）](./docs/操作指引-模式与图片编辑(新手).md)
++- [上游原始 README](./README-upstream.md)
+ 
+ ---
+@@ -197,11 +202,12 @@
+ ## 📜 许可证
+ 
+-本项目采用 [GNU General Public License v3.0](LICENSE) 开源，允许自由使用、修改和分发，但衍生作品必须以相同许可证开源。
+-
+----
+-
+-## 📞 联系作者
+-
+-- 📧 邮箱：n3032747608@163.com
+-- 🐧 QQ：3032747608
+-- 📦 GitHub：[RMA-MUN/OnmyojiAuto](https://github.com/RMA-MUN)
++本项目与上游一致，采用 [GNU General Public License v3.0](./LICENSE) 开源。
++允许自由使用、修改和分发，但**衍生作品必须以相同许可证开源**，并保留原始版权声明。
++
++原始项目版权归 **RMA-MUN** 所有；本仓库仅包含在此基础上进行的修改。
++
++---
++
++## ⚠️ 免责声明
++
++本工具仅供学习交流，禁止商用及违规使用，使用风险自负。
 
 --- a/main.py
 +++ b/main.py

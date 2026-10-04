@@ -16,6 +16,10 @@ from qfluentwidgets import (
 
 from OAT.tools.settings import APP_VERSION, settings_data, update_settings, MUMU_FOLDER
 
+# 软件内展示与更新检查统一指向的仓库地址（改这里即可换仓库）。
+# 上游原项目: https://github.com/RMA-MUN/OnmyojiAuto
+GITHUB_REPO_URL = "https://github.com/1939872325as-dotcom/OTA2new"
+
 
 class SettingsPage(QWidget):
     transparency_changed = QtCore.pyqtSignal(int)
@@ -410,10 +414,10 @@ class SettingsPage(QWidget):
         group.addSettingCard(version_card)
 
         github_card = HyperlinkCard(
-            "https://github.com/RMA-MUN/OnmyoujiAuto",
+            GITHUB_REPO_URL,
             "前往 GitHub", FIF.GITHUB,
             "GitHub 仓库",
-            "如果您觉得本工具对您有帮助，在Github给个star支持一下！",
+            "本仓库是 OAT 的修改版，原项目：RMA-MUN/OnmyojiAuto",
             self
         )
         group.addSettingCard(github_card)
