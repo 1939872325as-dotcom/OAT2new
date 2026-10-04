@@ -1,0 +1,2491 @@
+--- a/OAT/app/main_window.py
++++ b/OAT/app/main_window.py
+@@ -374,18 +374,24 @@
+ 
+     def window_detection(self, *args):
+-        logger.info("客户端窗口检测：")
+-        automation = OnmyojiAutomation(self.window_title, hwnd=getattr(self, 'selected_hwnd', None))
+-        if automation.is_window_present() is False:
+-            warning_box("未检测到阴阳师窗口，请先打开游戏")
+-            return
+-        automation.print_window_info()
+-        checker = WindowChecker()
+-        checker.set_window_title(self.window_title)
+-        if getattr(self, 'selected_hwnd', None):
+-            checker.set_window_handle(self.selected_hwnd)
+-        window_size = checker.get_window_info()
+-        if window_size:
+-            logger.info(f"当前客户端大小：宽度 {window_size[2][0]}，高度 {window_size[2][1]}")
+-        checker.connect_all()
++        # 本方法是定时器回调：异常绝不能逃逸出去，否则每一轮都会产生一条
++        # “Uncaught exception”（曾因窗口句柄失效刷屏 (1400, ...)）。
++        # 句柄失效本身由 WindowChecker 内部用 IsWindow 校验并重新解析。
++        try:
++            logger.info("客户端窗口检测：")
++            automation = OnmyojiAutomation(self.window_title, hwnd=getattr(self, 'selected_hwnd', None))
++            if automation.is_window_present() is False:
++                warning_box("未检测到阴阳师窗口，请先打开游戏")
++                return
++            automation.print_window_info()
++            checker = WindowChecker()
++            checker.set_window_title(self.window_title)
++            if getattr(self, 'selected_hwnd', None):
++                checker.set_window_handle(self.selected_hwnd)
++            window_size = checker.get_window_info()
++            if window_size:
++                logger.info(f"当前客户端大小：宽度 {window_size[2][0]}，高度 {window_size[2][1]}")
++            checker.connect_all()
++        except Exception as e:
++            logger.warning(f"窗口检测失败（窗口可能已关闭或句柄失效）: {e}")
+ 
+     def clean_threads(self):
+@@ -535,5 +541,5 @@
+                 thread.join(timeout=0.5)
+                 if thread.is_alive():
+-                    logger.warn(f"警告：线程 {thread.ident} 无法正常终止")
++                    logger.warning(f"警告：线程 {thread.ident} 无法正常终止")
+         logger.info("紧急停止，退出窗口")
+         with self.lock:
+@@ -544,5 +550,5 @@
+                     thread.join(timeout=0.5)
+                     if thread.is_alive():
+-                        logger.warn(f"警告：线程 {thread.ident} 无法正常终止")
++                        logger.warning(f"警告：线程 {thread.ident} 无法正常终止")
+         QtWidgets.QApplication.quit()
+ 
+@@ -737,5 +743,8 @@
+                     try:
+                         wc.set_window_handle(int(hwnd))
+-                        current_size = wc.get_window_info()
++                        # 与 resize_window 保持一致：都按【客户区】尺寸比较。
++                        # get_window_info() 返回的是含标题栏/边框的外框尺寸，
++                        # 拿它和客户区目标比会永远不相等、每次同步都白调整一遍。
++                        current_size = wc.get_client_info()
+                         if current_size:
+                             current_width, current_height = current_size[2]
+@@ -1197,4 +1206,13 @@
+         except Exception as e:
+             logger.error(f"清理缓存时出错: {e}")
++        finally:
++            # 清理完立刻刷新卡片上的占用数字。注意日志文件刚被清空，
++            # 这一行日志本身会让它不再为 0，属正常现象。
++            try:
++                refresh = getattr(self.settings_page, "refresh_cache_size", None)
++                if callable(refresh):
++                    refresh()
++            except Exception:
++                pass
+ 
+     def open_mode_editor_dialog(self):
+
+--- a/OAT/app/settings_page.py
++++ b/OAT/app/settings_page.py
+@@ -178,6 +178,26 @@
+         self.clear_cache_button = self.clear_cache_card.button
+         group.addSettingCard(self.clear_cache_card)
++        self.refresh_cache_size()
+ 
+         parent_layout.addWidget(group)
++
++    def refresh_cache_size(self):
++        """把当前缓存占用刷到「清理缓存」卡片上。
++
++        体积来自 cache_utils，与 clean_cache 用的是同一批路径，保证所见即所清。
++        任何异常都不该影响设置页显示，故整体兜底。
++        """
++        try:
++            from OAT.utils.cache_utils import compute_cache_size, format_size
++            total, detail = compute_cache_size()
++            self.clear_cache_card.setContent(
++                f"清理截图画廊和日志文件｜当前占用 {format_size(total)}（{detail}）")
++        except Exception:
++            pass
++
++    def showEvent(self, event):
++        # 每次切到设置页时重算一次，避免显示的是上次打开时的旧数字
++        super().showEvent(event)
++        self.refresh_cache_size()
+ 
+     def _create_emulator_group(self, parent_layout):
+
+--- a/OAT/config/check_update.py
++++ b/OAT/config/check_update.py
+@@ -1,4 +1,8 @@
++import json
++import os
++import re
++import time
++
+ import requests
+-from urllib3.exceptions import InsecureRequestWarning
+ 
+ from OAT.tools.settings import APP_VERSION
+@@ -12,7 +16,4 @@
+     """
+ 
+-    # 禁用不安全请求警告
+-    requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+-
+     # 版本相关常量
+     CURRENT_VERSION = f"{APP_VERSION}"  # 当前版本，不允许修改，用于检查是否更新
+@@ -20,4 +21,9 @@
+     GITHUB_REPO = "OnmyojiAuto"  # 仓库名
+ 
++    # 未认证访问 api.github.com 的配额是每 IP 每小时 60 次；曾经每次启动都请求，
++    # 连续开关几次程序就会 403 rate limit。这里做 1 小时本地缓存，
++    # 启动阶段直接读缓存，避免打满配额。
++    CACHE_TTL_SECONDS = 3600
++
+     def __init__(self, owner: str = None, repo: str = None, current_version: str = CURRENT_VERSION):
+         """
+@@ -31,11 +37,46 @@
+         self.repo = repo if repo else self.GITHUB_REPO
+         self.current_version = current_version if current_version else self.CURRENT_VERSION
+-
+-    def get_latest_release_info(self) -> dict | None:
++        # 最近一次检查的失败原因；None 表示检查成功
++        self.last_error: str | None = None
++
++    # ---------- 本地缓存 ----------
++
++    @property
++    def _cache_path(self) -> str:
++        return os.path.join(os.path.dirname(os.path.abspath(__file__)), 'update_cache.json')
++
++    def _read_cache(self):
++        """读取缓存的 release 信息，返回 (info, fetched_at)；无缓存返回 (None, 0)"""
++        try:
++            with open(self._cache_path, 'r', encoding='utf-8') as f:
++                cache = json.load(f)
++            info = cache.get('info')
++            fetched_at = float(cache.get('fetched_at', 0))
++            if isinstance(info, dict):
++                return info, fetched_at
++        except Exception:
++            pass
++        return None, 0.0
++
++    def _write_cache(self, info: dict) -> None:
++        try:
++            with open(self._cache_path, 'w', encoding='utf-8') as f:
++                json.dump({'fetched_at': time.time(), 'info': info}, f, ensure_ascii=False)
++        except Exception as e:
++            logger.warning(f"写入更新缓存失败（不影响本次检查）: {e}")
++
++    # ---------- 请求 ----------
++
++    def get_latest_release_info(self, use_cache: bool = True) -> dict | None:
+         """
+         获取指定GitHub仓库的最新release信息。
+ 
++        :param use_cache: 是否允许使用本地缓存（默认允许）
+         :return: 最新release信息的字典，如果获取失败则返回None
+         """
++        cached_info, fetched_at = self._read_cache()
++        if use_cache and cached_info is not None and time.time() - fetched_at < self.CACHE_TTL_SECONDS:
++            return cached_info
++
+         api_url = f"https://api.github.com/repos/{self.owner}/{self.repo}/releases/latest"
+         headers = {
+@@ -45,8 +86,12 @@
+ 
+         try:
+-            response = requests.get(api_url, headers=headers, verify=False, timeout=10)
+-            # print(f"响应状态码: {response.status_code}")
+-            # print(f"响应头: {response.headers}")
+-            # print(f"响应内容前200字符: {response.text[:200]}...")
++            response = requests.get(api_url, headers=headers, timeout=10)
++
++            if response.status_code == 403 and response.headers.get('X-RateLimit-Remaining') == '0':
++                # 配额耗尽不是程序故障：降级为提示，并回退到缓存
++                self.last_error = "GitHub API 访问频率超限(403)"
++                logger.warning(f"检查更新失败：GitHub API 访问频率超限，"
++                               f"将在 {response.headers.get('X-RateLimit-Reset', '?')} 后恢复")
++                return cached_info
+ 
+             response.raise_for_status()  # 检查请求是否成功
+@@ -54,12 +99,19 @@
+             # 尝试解析JSON
+             info = response.json()
++            self.last_error = None
++            self._write_cache(info)
+             return info
+ 
++        except json.JSONDecodeError as e:
++            # response.json() 解析失败时抛的是 requests.exceptions.JSONDecodeError，
++            # 它同时是 json.JSONDecodeError 和 RequestException 的子类，必须放在
++            # RequestException 之前（原代码写的 except KeyError 永远进不来）
++            self.last_error = f"响应内容解析失败: {e}"
++            logger.warning(f"检查更新响应解析失败: {e}")
++            return cached_info
+         except requests.exceptions.RequestException as e:
+-            logger.error(f"检查更新请求失败: {e}")
+-            return None
+-        except KeyError:
+-            logger.error("未找到tag_name字段，请检查仓库是否有release")
+-            return None
++            self.last_error = str(e)
++            logger.warning(f"检查更新请求失败: {e}")
++            return cached_info
+ 
+     @staticmethod
+@@ -71,5 +123,5 @@
+         :return: tag name字符串，如果未找到则返回None
+         """
+-        return info.get("tag_name")
++        return (info or {}).get("tag_name")
+ 
+     @staticmethod
+@@ -81,5 +133,5 @@
+         :return: 更新描述字符串，如果未找到则返回None
+         """
+-        return info.get("body")
++        return (info or {}).get("body")
+ 
+     @staticmethod
+@@ -91,9 +143,22 @@
+         :return: 版本号数字列表，例如 [1, 5, 4]
+         """
++        if not version:
++            return []
+         # 处理带前缀的版本字符串
+-        if "-v" in version:
+-            version = version.split("-v")[-1]
+-        # 按点分割版本号，转换为整数列表
+-        return [int(part) for part in version.split(".")]
++        text = str(version).strip()
++        if "-v" in text:
++            text = text.split("-v")[-1]
++        elif text[:1] in ("v", "V"):
++            text = text[1:]
++        # 按 . - _ + 切分，逐段取前导数字，遇到第一段纯非数字即停止；
++        # 这样 "OAT-v2.3.3-beta1" 也能稳妥地得到 [2, 3, 3]，不会抛 ValueError
++        parts = []
++        for segment in re.split(r"[.\-_+]", text):
++            match = re.match(r"^(\d+)", segment)
++            if match:
++                parts.append(int(match.group(1)))
++            elif parts:
++                break
++        return parts
+ 
+     def latest_version(self) -> str | None:
+@@ -108,4 +173,18 @@
+         return None
+ 
++    def has_update(self) -> bool:
++        """
++        是否检测到了比当前更高的版本（不关心检查本身是否成功）。
++        """
++        info = self.get_latest_release_info()
++        latest_tag = self.get_tag(info)
++        if not latest_tag:
++            return False
++        latest_version = self.split_version(latest_tag)
++        current_version = self.split_version(self.current_version)
++        if not latest_version or not current_version:
++            return False
++        return latest_version > current_version
++
+     def check_update(self) -> bool:
+         """
+@@ -114,14 +193,5 @@
+         :return: 如果需要更新则返回True，否则返回False
+         """
+-        info = self.get_latest_release_info()
+-        if info:
+-            latest_tag = self.get_tag(info)
+-            if latest_tag:
+-                latest_version = self.split_version(latest_tag)  # ["1", "5", "4"]
+-                current_version = self.split_version(self.current_version)  # ["1", "5", "3"]
+-                # print(f"【调试】最新版本: {latest_version}, 当前版本: {current_version}")
+-                if latest_version > current_version:
+-                    return True
+-        return False
++        return self.has_update()
+ 
+ 
+@@ -132,15 +202,4 @@
+     # 获取最新版本信息
+     latest_info = checker.get_latest_release_info()
+-
+-    # # 输出最新版本信息和更新描述
+-    # if latest_info:
+-    #     tag = checker.get_tag(latest_info)
+-    #     update_info = checker.get_update_info(latest_info)
+-    #     print(f"最新版本: {tag}")
+-    #     print(f"更新描述: {update_info}")
+-    #     if checker.check_update():
+-    #         print("当前版本需要更新")
+-    #     else:
+-    #         print("当前版本已更新")
+ 
+     # 检查是否需要更新
+
+--- a/OAT/config/update_manager.py
++++ b/OAT/config/update_manager.py
+@@ -9,5 +9,4 @@
+ import shutil
+ import traceback
+-from urllib3.exceptions import InsecureRequestWarning
+ 
+ from OAT.utils.logging import logger
+@@ -15,6 +14,4 @@
+ from OAT.utils.error_handler import log_error
+ 
+-# 禁用不安全请求警告
+-requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+ 
+ class UpdateManager:
+@@ -32,5 +29,5 @@
+         # 确保文件存在
+         if not os.path.exists(update_json_path):
+-            logger.warn(f"警告：配置文件不存在: {update_json_path}")
++            logger.warning(f"警告：配置文件不存在: {update_json_path}")
+             # 创建默认配置
+             default_config = {
+@@ -47,5 +44,5 @@
+         # 确保配置数据有效
+         if self.config_data is None:
+-            logger.warn("警告：配置文件读取失败，使用默认配置")
++            logger.warning("警告：配置文件读取失败，使用默认配置")
+             self.config_data = {
+                 "ignore_versions": []
+@@ -155,5 +152,5 @@
+             # 先获取远程文件大小
+             try:
+-                head_response = requests.head(url, timeout=30, verify=False, allow_redirects=True)
++                head_response = requests.head(url, timeout=30, allow_redirects=True)
+                 head_response.raise_for_status()
+                 remote_size = int(head_response.headers.get("content-length", 0))
+@@ -180,5 +177,5 @@
+                     try:
+                         # 获取远程文件大小
+-                        head_response = requests.head(url, timeout=30, verify=False, allow_redirects=True)
++                        head_response = requests.head(url, timeout=30, allow_redirects=True)
+                         head_response.raise_for_status()
+                         remote_size = int(head_response.headers.get("content-length", 0))
+@@ -202,5 +199,5 @@
+                 
+                 # 发送HTTP请求，获取文件大小
+-                response = requests.get(url, stream=True, timeout=30, verify=False)
++                response = requests.get(url, stream=True, timeout=30)
+                 response.raise_for_status()
+                 
+@@ -242,5 +239,5 @@
+                     if retry_count <= max_retries:
+                         wait_time = 2 ** retry_count  # 指数退避
+-                        logger.warn(f"服务器错误 ({e.response.status_code})，将在 {wait_time} 秒后重试...")
++                        logger.warning(f"服务器错误 ({e.response.status_code})，将在 {wait_time} 秒后重试...")
+                         time.sleep(wait_time)
+                         continue
+@@ -254,5 +251,5 @@
+                 if retry_count <= max_retries:
+                     wait_time = 2 ** retry_count  # 指数退避
+-                    logger.warn(f"网络请求失败: {e}，将在 {wait_time} 秒后重试...")
++                    logger.warning(f"网络请求失败: {e}，将在 {wait_time} 秒后重试...")
+                     time.sleep(wait_time)
+                     continue
+
+--- a/OAT/pipeline/recognition_opencv.py
++++ b/OAT/pipeline/recognition_opencv.py
+@@ -191,4 +191,12 @@
+                     confidence=float(max_val),
+                 )
++            # 未达阈值：把「最高分 / 阈值 / 最佳位置」打出来。
++            # 以前这里是无声失败，只能看到后面莫名走了 OCR。分数差一点 → 多半是
++            # 窗口尺寸变了或阈值偏严；分数很低 → 模板图和当前界面不是同一处，要重截。
++            logger.warning(
++                f"模板未达阈值: {template_path} 最高分 {max_val:.3f} < 阈值 {threshold:.3f}"
++                f"（最佳位置 x={max_loc[0] + offset_x} y={max(0, max_loc[1] + offset_y - title_bar)}，"
++                f"模板 {w}x{h}，截图 {sh}x{sw}）"
++            )
+         except Exception as e:
+             logger.error(f"模板匹配出错: {e}")
+@@ -196,10 +204,31 @@
+         return RecognitionResult(found=False)
+ 
+-    def find_text(self, target_text: str, confidence: float = 0.8) -> RecognitionResult:
++    def find_text(self, target_text: str, confidence: float = 0.8,
++                  region: Tuple = None) -> RecognitionResult:
+         screenshot = self.capture_screenshot()
+         if screenshot is None:
+             return RecognitionResult(found=False)
+ 
+-        found, text_area, real_text = ocr_service.find_text(screenshot, target_text)
++        # region 是客户区坐标 [x1, x2, y1, y2]；截图可能含标题栏，需先换算成截图坐标
++        shot_region = None
++        if region and len(region) == 4:
++            try:
++                sh = screenshot.shape[0]
++                _, _, _, ch = self.get_window_rect()
++                title_bar = effective_client_dy(sh, ch, self._get_title_bar_height())
++                rx1, rx2, ry1, ry2 = (int(v) for v in region)
++                shot_region = [rx1, rx2, ry1 + title_bar, ry2 + title_bar]
++                logger.info(f"OCR 限定搜索区域（客户区）[{rx1}, {rx2}, {ry1}, {ry2}]"
++                            f" → 截图坐标 {shot_region}")
++            except Exception as e:
++                logger.warning(f"OCR 搜索区域换算失败，已忽略: {region} ({e})")
++                shot_region = None
++
++        # confidence 是本任务配置的 OCR 阈值，必须真的传下去。
++        # 以前这里没传，ocr_confidence 形同虚设（一直用 OCR 侧默认值）。
++        found, text_area, real_text = ocr_service.find_text(
++            screenshot, target_text, confidence_threshold=confidence, region=shot_region)
++        # OCR 侧算出的真实置信度（0~1）：不填的话日志里永远是“置信度: 0.00”
++        ocr_conf = float(getattr(ocr_service, "last_match_confidence", 0.0))
+         if found and text_area:
+             sh = screenshot.shape[0]
+@@ -213,7 +242,13 @@
+             w, h = int(max(xs) - min(xs)), int(max(ys) - min(ys))
+             w, h = max(0, w), max(0, h)
++            if not w or not h:
++                # 文字框退化成一条线时 region 无效，点了也没意义：判未匹配并说明原因
++                logger.warning(f"OCR 命中 '{real_text}' 但文字框无效"
++                               f"（x={x} y={y} w={w} h={h}），按未匹配处理")
++                return RecognitionResult(found=False)
+             return RecognitionResult(
+                 found=True,
+                 region=(x, y, w, h),
++                confidence=ocr_conf,
+                 text=real_text,
+             )
+@@ -221,10 +256,19 @@
+ 
+     def _click_postmessage(self, x: int, y: int) -> None:
+-        l_param = x | (y << 16)
+-        win32gui.PostMessage(self.hwnd, win32con.WM_MOUSEMOVE, 0, l_param)
+-        time.sleep(0.05)
+-        win32gui.PostMessage(self.hwnd, win32con.WM_LBUTTONDOWN, win32con.MK_LBUTTON, l_param)
+-        time.sleep(0.2)
+-        win32gui.PostMessage(self.hwnd, win32con.WM_LBUTTONUP, 0, l_param)
++        # 与 _swipe_postmessage 保持一致：句柄无效时 PostMessage 会静默失败，
++        # 表现就是“日志说成功但实际没点”。这里必须检查并报错。
++        if not self.hwnd or not win32gui.IsWindow(self.hwnd):
++            logger.error(f"点击失败：窗口句柄无效（hwnd={self.hwnd}），消息未发送。"
++                         f"窗口可能已关闭，请重新窗口检测")
++            return
++        try:
++            l_param = x | (y << 16)
++            win32gui.PostMessage(self.hwnd, win32con.WM_MOUSEMOVE, 0, l_param)
++            time.sleep(0.05)
++            win32gui.PostMessage(self.hwnd, win32con.WM_LBUTTONDOWN, win32con.MK_LBUTTON, l_param)
++            time.sleep(0.2)
++            win32gui.PostMessage(self.hwnd, win32con.WM_LBUTTONUP, 0, l_param)
++        except Exception as e:
++            logger.error(f"点击 ({x},{y}) 发送失败: {e}")
+ 
+     def _swipe_postmessage(self, x1: int, y1: int, x2: int, y2: int, duration: float) -> None:
+
+--- a/OAT/pipeline/runner.py
++++ b/OAT/pipeline/runner.py
+@@ -45,4 +45,10 @@
+     def run(self, times: int) -> bool:
+         """执行挑战主循环"""
++        # 各图在「编辑图像配置」里可单独设置点击后随机等待；这里只提示默认区间
++        _lo, _hi = self._click_wait_range()
++        _custom = [t.name for t in self.tasks
++                   if getattr(t, "click_wait_min", None) is not None]
++        logger.info(f"点击后随机等待：默认 {_lo:g}~{_hi:g} 秒"
++                    + (f"；已单独配置的图：{', '.join(_custom)}" if _custom else "（可在 编辑图像配置 里按图修改）"))
+         try:
+             i = 0
+@@ -76,6 +82,10 @@
+                 if self.current_next and self.current_next in self._task_map:
+                     if self._process_next_task():
+-                        task = self._task_map[self.current_next]
+-                        if task.is_start:
++                        # 注意：_match_and_execute 已经把 current_next 改成它自己的 next 了，
++                        # 所以这里必须取「刚刚匹配到的任务」。原实现写的是
++                        # self._task_map[self.current_next] —— 拿到的是下一张任务（is_start 判错），
++                        # 而且当 next 为空时 self._task_map[None] 会 KeyError，直接崩掉整个挑战。
++                        active = self._get_last_matched()
++                        if active and active.is_start:
+                             i += 1
+                             logger.info(f"还剩{times - i}次挑战")
+@@ -140,5 +150,6 @@
+ 
+         if time.time() - self.next_start_time > task.timeout:
+-            logger.warn(f"识别超时：{task.name}，回到默认识别模式")
++            logger.warning(f"识别超时：{task.name}（{task.timeout} 秒内未出现），回到默认识别模式")
++            self._timed_out_next = task.name
+             self.current_next = None
+             self.next_start_time = None
+@@ -181,7 +192,24 @@
+             return False
+ 
+-        if result.text:
+-            logger.info(f"OCR识别: {result.text}")
+-        logger.info(f"匹配到: {task.name} (置信度: {result.confidence:.2f})")
++        via = f"OCR('{result.text}')" if result.text else "模板匹配"
++        logger.info(f"匹配到: {task.name}（方式: {via}，置信度: {result.confidence:.3f}，"
++                    f"识别区域: {result.region}，"
++                    f"设定: 阈值={task.threshold} ocr阈值={task.ocr_confidence} "
++                    f"下一张={task.next or '无'}{'，挑战起点' if task.is_start else ''}）")
++
++        # 上一轮等它的 next 等超时了、现在它又匹配到：说明上一步的点击没生效
++        if getattr(self, "_timed_out_next", None) == task.name:
++            logger.warning(f"任务 {task.name} 再次匹配到，但它设定的下一张「{task.next}」之前已超时未出现："
++                           f"上一步的点击很可能没有生效（或该步本就不需要点击）")
++            self._timed_out_next = None
++
++        # OCR 是子串匹配：目标是短词时很容易命中“更长但不同位置”的另一处文字
++        # （典型：目标“退治”，却命中了页面标题“妖怪退治”）。这种情况必须点名，
++        # 否则日志只显示“匹配到”，看不出点错了地方。
++        if result.text and task.ocr_text and result.text.strip() != task.ocr_text.strip():
++            logger.warning(f"注意：OCR 目标是 '{task.ocr_text}'，实际命中的是更长的文字块 "
++                           f"'{result.text}'（子串匹配），命中区域 {result.region}。"
++                           f"若这不是你要点的位置，请把 OCR 目标文字改成完整文字，"
++                           f"或用「OCR搜索区域」限定范围")
+ 
+         self._execute_action(task, result)
+@@ -206,9 +234,19 @@
+ 
+         if task.recognition == "ocr":
+-            return self.engine.find_text(task.ocr_text or "", task.ocr_confidence)
++            if task.ocr_region:
++                logger.info(f"任务 {task.name}：OCR 限定搜索区域 {list(task.ocr_region)}")
++            return self.engine.find_text(task.ocr_text or "", task.ocr_confidence,
++                                         region=task.ocr_region)
+         elif task.recognition == "template+ocr":
+             result = self.engine.find_template(full_path, task.threshold)
+             if not result.found and task.ocr_text:
+-                result = self.engine.find_text(task.ocr_text, task.ocr_confidence)
++                # 模板失败会静默退到 OCR —— 必须显式说明，否则用户只看到“匹配到”，
++                # 完全不知道走的不是模板（模板点击位置精确，OCR 命中的可能只是同名文字）
++                logger.warning(f"模板未匹配，改用 OCR 兜底：任务 {task.name}，模板 {task.template}，"
++                               f"OCR目标文字 '{task.ocr_text}'")
++                if task.ocr_region:
++                    logger.info(f"任务 {task.name}：OCR 限定搜索区域 {list(task.ocr_region)}")
++                result = self.engine.find_text(task.ocr_text, task.ocr_confidence,
++                                               region=task.ocr_region)
+             return result
+         else:
+@@ -218,6 +256,10 @@
+         """执行任务匹配后的动作（click / swipe / wait，pipeline 专属）"""
+         action_type = (task.action.type or "click")
++        logger.info(f"执行动作: {action_type}（点击目标类型: {task.action.target}）")
+         if action_type == "swipe":
+-            x1, y1 = self._resolve_click_coords(task, result)
++            coords = self._resolve_click_coords(task, result)
++            if coords is None:
++                return
++            x1, y1 = coords
+             x2, y2 = x1, y1
+             if task.action.ex_range and task.action.ey_range:
+@@ -230,7 +272,8 @@
+                 except (ValueError, TypeError):
+                     y2 = y1
++            duration = task.action.duration if task.action.duration is not None else 0.5
++            logger.info(f"后台滑动 ({x1},{y1}) → ({x2},{y2})，时长 {duration}s")
+             self.engine.swipe(int(x1), int(y1), int(x2), int(y2),
+-                              duration=(task.action.duration if task.action.duration is not None else 0.5),
+-                              sync_mode=self.sync_mode)
++                              duration=duration, sync_mode=self.sync_mode)
+         elif action_type == "wait":
+             raw = task.action.duration if task.action.duration is not None else 1.0
+@@ -239,21 +282,91 @@
+             except (ValueError, TypeError):
+                 seconds = 1.0
+-            time.sleep(max(0.0, seconds))
++            seconds = max(0.0, seconds)
++            logger.info(f"等待 {seconds} 秒")
++            time.sleep(seconds)
+         else:
+-            x, y = self._resolve_click_coords(task, result)
++            coords = self._resolve_click_coords(task, result)
++            if coords is None:
++                return
++            x, y = coords
++            logger.info(f"后台点击 ({x}, {y})")
+             self.engine.click(x, y, sync_mode=self.sync_mode)
+-
+-    def _resolve_click_coords(self, task: Task, result) -> tuple:
+-        """确定点击坐标"""
++            self._sleep_after_click(task)
++
++    def _click_wait_range(self, task: Optional[Task] = None) -> tuple:
++        """点击后随机等待区间（秒）。
++
++        优先用该任务自己的配置（在「编辑图像配置」里按图设置），
++        没配则回落到默认 0.3~5 秒。
++        """
++        lo = hi = None
++        if task is not None:
++            lo = getattr(task, "click_wait_min", None)
++            hi = getattr(task, "click_wait_max", None)
++        try:
++            lo = float(lo) if lo is not None else None
++            hi = float(hi) if hi is not None else None
++        except (ValueError, TypeError):
++            lo = hi = None
++        if lo is None or hi is None:
++            lo, hi = 0.3, 5.0
++        if lo < 0:
++            lo = 0.0
++        if hi < 0:
++            hi = 0.0
++        if hi < lo:
++            lo, hi = hi, lo
++        return lo, hi
++
++    def _sleep_after_click(self, task: Optional[Task] = None) -> None:
++        """点击后的随机等待。
++
++        区间来自该图的「点击后随机等待」配置（默认 0.3~5 秒），
++        作用：模拟人工节奏，避免固定间隔点击被识别为脚本。
++        暂停不计入休眠、停止则立即返回；每次都把实际秒数写进日志便于核对。
++        """
++        lo, hi = self._click_wait_range(task)
++        try:
++            seconds = random.uniform(lo, hi)
++        except Exception:
++            seconds = lo
++        _who = f"任务 {task.name}" if task is not None else "默认"
++        logger.info(f"点击后随机等待 {seconds:.2f} 秒（{_who} 区间 {lo:g}~{hi:g}）")
++        if seconds <= 0:
++            return
++        _start = time.time()
++        try:
++            # 与主循环一致：用 pause_aware_sleep，暂停时不计入等待时间
++            done = pause_aware_sleep(seconds, 0.1)
++        except Exception:
++            time.sleep(seconds)
++            done = True
++        _actual = time.time() - _start
++        if not done:
++            logger.info(f"等待被中断（已等待 {_actual:.2f} 秒，挑战已停止）")
++        elif _actual > seconds + 0.5:
++            # 实际远大于目标：多半是中途被暂停过，记一下便于排查
++            logger.info(f"实际等待 {_actual:.2f} 秒（含暂停时间），目标 {seconds:.2f} 秒")
++
++    def _resolve_click_coords(self, task: Task, result):
++        """确定点击坐标（客户区逻辑坐标）；无法确定时返回 None 并记录原因"""
+         if task.action.target == "fixed_coord" and task.action.x_range and task.action.y_range:
+-            return (
+-                random.randint(int(task.action.x_range[0]), int(task.action.x_range[1])),
+-                random.randint(int(task.action.y_range[0]), int(task.action.y_range[1])),
+-            )
+-        # matched / ocr_area
++            try:
++                return (
++                    random.randint(int(task.action.x_range[0]), int(task.action.x_range[1])),
++                    random.randint(int(task.action.y_range[0]), int(task.action.y_range[1])),
++                )
++            except (ValueError, TypeError, IndexError) as e:
++                logger.error(f"任务 {task.name} 的固定点击区域无效"
++                             f"（x_range={task.action.x_range}, y_range={task.action.y_range}）: {e}")
++                return None
++        # matched / ocr_area：用识别到的区域
+         if result.region:
+             # OCR 返回的 region 可能是 float，randint/位运算要求 int，这里统一转换
+             rx, ry, rw, rh = (int(v) for v in result.region)
+             rw, rh = max(0, rw), max(0, rh)
++            if rw <= 0 or rh <= 0:
++                logger.error(f"任务 {task.name} 的识别区域无效: {result.region}，已跳过点击")
++                return None
+             cx = rx + rw // 2
+             cy = ry + rh // 2
+@@ -271,5 +384,11 @@
+                 random.randint(lo_y, hi_y),
+             )
+-        return (0, 0)
++        # 既没有可用的固定区域、也没有识别区域。原来这里静默返回 (0, 0)，
++        # 会点到窗口左上角 —— 表现就是“日志说成功、实际点了个没用的地方”。
++        logger.error(f"任务 {task.name}: 无法确定点击坐标"
++                     f"（target={task.action.target}，固定区域={task.action.x_range}/{task.action.y_range}，"
++                     f"识别区域={result.region}），已跳过点击；"
++                     f"请在图片配置里设置「点击区域」，或确认该识别方式能返回区域")
++        return None
+ 
+     def _update_consecutive(self, task_name: str) -> None:
+
+--- a/OAT/pipeline/task_definition.py
++++ b/OAT/pipeline/task_definition.py
+@@ -30,4 +30,11 @@
+     ocr_text: Optional[str] = None
+     ocr_confidence: float = 0.8
++    # OCR 搜索区域 (x1, x2, y1, y2)，客户区坐标；None = 全窗口。
++    # 用于排除同页出现的相同文字（否则可能点到另一处同名文字）。
++    ocr_region: Optional[tuple] = None
++
++    # 点击后随机等待区间（秒），每张图可单独配置；None = 用运行时默认 0.3~5
++    click_wait_min: Optional[float] = None
++    click_wait_max: Optional[float] = None
+ 
+     # 管道控制
+@@ -66,4 +73,26 @@
+ 
+ 
++def _parse_wait_range(lo_raw, hi_raw):
++    """点击后随机等待区间解析：非法/缺省 -> (None, None)，由运行时回退默认。
++
++    只填了一个时，另一个用默认补全；写反了自动交换；负数按非法处理。
++    """
++    lo = _parse_duration(lo_raw)
++    hi = _parse_duration(hi_raw)
++    if lo is not None and lo < 0:
++        lo = None
++    if hi is not None and hi < 0:
++        hi = None
++    if lo is None and hi is None:
++        return None, None
++    if lo is None:
++        lo = 0.3
++    if hi is None:
++        hi = 5.0
++    if hi < lo:
++        lo, hi = hi, lo
++    return lo, hi
++
++
+ def parse_pipeline(pipeline_data: dict) -> List[Task]:
+     """从 dict（来自 config.json 的 pipeline key）解析为 Task 列表"""
+@@ -87,4 +116,5 @@
+             ocr_text=item.get("ocr_text"),
+             ocr_confidence=item.get("ocr_confidence", 0.8),
++            ocr_region=tuple(item["ocr_region"]) if item.get("ocr_region") else None,
+             next=item.get("next"),
+             is_start=item.get("is_start", False),
+@@ -95,4 +125,6 @@
+             max_consecutive=_parse_max_consecutive(item.get("max_consecutive", 5)),
+         )
++        task.click_wait_min, task.click_wait_max = _parse_wait_range(
++            item.get("click_wait_min"), item.get("click_wait_max"))
+         tasks.append(task)
+     return tasks
+
+--- a/OAT/source/__init__.py
++++ b/OAT/source/__init__.py
+@@ -27,5 +27,5 @@
+ 
+     if isinstance(folder_info, dict):
+-        folder_name = folder_info.get(sub_mode, folder_info['default'])
++        folder_name = folder_info.get(sub_mode) or folder_info.get('default') or ''
+         if not folder_name:
+             raise ValueError(f"模式 {mode} 下无有效子模式配置: {sub_mode}")
+@@ -38,4 +38,22 @@
+ 
+     return script_dir
++
++def _notify_mode_error(message: str) -> None:
++    """模式无法启动时给出可见提示
++
++    此前只在日志里记一条 ERROR 就 return，界面上表现为“点了开始没有反应”，
++    用户只能去翻日志。
++    """
++    try:
++        from OAT.utils.warning_box import warning_box
++        available = '、'.join(k for k in MODE_MAPPING if MODE_MAPPING[k])
++        warning_box(
++            f"无法启动该模式：{message}\n\n"
++            f"请在 mode.json 中登记该模式，并确认对应目录存在。\n"
++            f"当前可用模式：{available}"
++        )
++    except Exception:
++        pass
++
+ 
+ # 模式选择函数
+@@ -52,7 +70,9 @@
+         logger.error(f"模式配置错误: {e}")
+         logger.error('请检查是否正确选择了模式或配置文件！')
++        _notify_mode_error(str(e))
+         return
+     except FileNotFoundError as e:
+         logger.error(f"路径错误: {e}")
++        _notify_mode_error(f"模式目录不存在：{e}")
+         return
+ 
+
+--- a/OAT/source/common_challenge.py
++++ b/OAT/source/common_challenge.py
+@@ -58,4 +58,6 @@
+         self.image_paths = {}
+         self.image_info = {}
++        # 识别顺序（默认按 config 中 image_paths 的书写顺序）
++        self.ordered_keys = []
+         
+         # 使用设置中的阈值和识别模式
+@@ -91,5 +93,6 @@
+                     'ocr_target_text': v.get('ocr_target_text', ''),
+                     'ocr_action': v.get('ocr_action') or '点击文字所在区域',
+-                    'ocr_confidence_threshold': v.get('ocr_confidence_threshold', 0.8)
++                    'ocr_confidence_threshold': v.get('ocr_confidence_threshold', 0.8),
++                    'ocr_region': v.get('ocr_region', None)
+                 }
+             else:
+@@ -106,5 +109,6 @@
+                     'ocr_target_text': '',
+                     'ocr_action': '点击文字所在区域',
+-                    'ocr_confidence_threshold': 0.8
++                    'ocr_confidence_threshold': 0.8,
++                    'ocr_region': None
+                 }
+             
+@@ -112,6 +116,24 @@
+             # 预加载图像以提高后续识别速度
+             self.automation_obj.preload_image(path)
+-        
++
++        self._build_recognition_order()
+         logger.info(f"已预加载 {len(self.image_paths)} 张图像模板")
++
++    def _build_recognition_order(self):
++        """确定识别顺序
++
++        config 中的 recognition_order 是作者显式声明的识别优先级；此前该字段
++        没有任何代码读取，实际顺序退化为 JSON 键的书写顺序。未声明时仍按
++        image_paths 的书写顺序（Python 3.7+ dict 保序）。
++        """
++        declared = self.config.get('recognition_order') or []
++        rank = {name: i for i, name in enumerate(declared)}
++        insertion = {name: i for i, name in enumerate(self.image_paths)}
++        self.ordered_keys = sorted(
++            self.image_paths,
++            key=lambda name: (rank.get(name, len(rank)), insertion[name]),
++        )
++        if declared:
++            logger.info(f"识别顺序: {' -> '.join(self.ordered_keys)}")
+     
+     def run(self) -> bool:
+@@ -127,6 +149,4 @@
+             # 跟踪图片连续出现次数
+             consecutive_count = {}
+-            # 跟踪重试次数
+-            retry_count = 0
+             # 跟踪开始识别下一个图片的时间
+             next_image_start_time = None
+@@ -160,5 +180,5 @@
+                     pass
+                 # 优先检测全局图片
+-                global_images = [key for key, info in self.image_info.items() if info['is_global']]
++                global_images = [k for k in self.ordered_keys if self.image_info[k]['is_global']]
+                 for key in global_images:
+                     img_path = self.image_paths[key]
+@@ -179,5 +199,4 @@
+                             # 重置连续出现次数，因为全局图片处理不影响正常流程
+                             consecutive_count = {}
+-                            retry_count = 0
+                             # 全局图片处理后继续循环，不改变current_next_image
+                             continue
+@@ -194,14 +213,14 @@
+                     # 检查是否超时
+                     if time.time() - next_image_start_time > NEXT_IMAGE_TIMEOUT:
+-                        logger.warn(f"识别超时：{current_next_image} 在 {NEXT_IMAGE_TIMEOUT} 秒内未找到，回到默认识别模式")
++                        logger.warning(f"识别超时：{current_next_image} 在 {NEXT_IMAGE_TIMEOUT} 秒内未找到，回到默认识别模式")
+                         current_next_image = None
+                         next_image_start_time = None
+                         consecutive_count = {}
+-                        retry_count = 0
+                     else:
+                         if current_next_image in self.image_paths:
+-                            img_path = self.image_paths[current_next_image]
++                            matched_key = current_next_image
++                            img_path = self.image_paths[matched_key]
+                             try:
+-                                info = self.image_info[current_next_image]
++                                info = self.image_info[matched_key]
+                                 if self.automation_obj.perform_action(
+                                     img_path, 
+@@ -212,25 +231,22 @@
+                                     ocr_enabled=info['ocr_enabled'],
+                                     ocr_target_text=info['ocr_target_text'],
+-                                    ocr_action=info['ocr_action']
++                                    ocr_action=info['ocr_action'],
++                                    ocr_region=info['ocr_region'],
++                                    ocr_confidence_threshold=info['ocr_confidence_threshold']
+                                 ):
+-                                    # 增加连续出现次数
+-                                    consecutive_count[current_next_image] = consecutive_count.get(current_next_image, 0) + 1
+-                                    count = consecutive_count[current_next_image]
+-                                    
++                                    # 增加连续出现次数（重试次数由同一张图的连续命中次数推导）
++                                    count = consecutive_count.get(matched_key, 0) + 1
++                                    consecutive_count[matched_key] = count
++
+                                     # 检查连续出现次数
+                                     if count == 2:
+-                                        logger.warn(f"警告：图片 {current_next_image} 已连续出现2次，开始计数重试")
+-                                        retry_count = 1
++                                        logger.warning(f"警告：图片 {matched_key} 已连续出现2次，开始计数重试")
+                                     elif count >= 5:
+-                                        logger.error(f"错误：图片 {current_next_image} 已连续出现5次，强制停止挑战")
++                                        logger.error(f"错误：图片 {matched_key} 已连续出现5次，强制停止挑战")
+                                         return False
+-                                    
+-                                    # 检查重试次数
+-                                    if retry_count > 0:
+-                                        logger.info(f"重试次数：{retry_count}/5")
+-                                        if retry_count >= 5:
+-                                            logger.error(f"错误：重试5次后图片 {current_next_image} 仍然存在，结束挑战")
+-                                            return False
+-                                        retry_count += 1
++
++                                    # 重试提示：从第2次连续命中起计数，第5次在上方强制停止
++                                    if count >= 2:
++                                        logger.info(f"重试次数：{count - 1}/5")
+                                     
+                                     if info['message']:
+@@ -245,23 +261,22 @@
+                                         # 挑战开始时重置连续出现次数
+                                         consecutive_count = {}
+-                                        retry_count = 0
+                                     # 更新下一个图片
+                                     current_next_image = info['next_image']
+                                     # 重置开始时间
+                                     next_image_start_time = None
+-                                    # 如果更新了下一个图片，重置连续出现次数
+-                                    if current_next_image != key:
++                                    # 切换到不同图片时重置连续出现次数（原实现引用了未定义的 key）
++                                    if current_next_image != matched_key:
+                                         consecutive_count = {}
+-                                        retry_count = 0
+                             except Exception as e:
+-                                pass
++                                logger.warning(f"处理图片 {matched_key} 失败: {e}")
+                 else:
+                     # 没有指定下一个图片时，尝试识别所有非全局图片
+                     # 过滤出非全局图片
+-                    non_global_images = [key for key, info in self.image_info.items() if not info['is_global']]
++                    non_global_images = [k for k in self.ordered_keys if not self.image_info[k]['is_global']]
+                     if non_global_images:
+                         # 按顺序尝试识别所有非全局图片
+                         for key in non_global_images:
+                             if key in self.image_paths:
++                                matched_key = key
+                                 img_path = self.image_paths[key]
+                                 try:
+@@ -275,25 +290,22 @@
+                                         ocr_enabled=info['ocr_enabled'],
+                                         ocr_target_text=info['ocr_target_text'],
+-                                        ocr_action=info['ocr_action']
++                                        ocr_action=info['ocr_action'],
++                                        ocr_region=info['ocr_region'],
++                                        ocr_confidence_threshold=info['ocr_confidence_threshold']
+                                     ):
+-                                        # 增加连续出现次数
+-                                        consecutive_count[key] = consecutive_count.get(key, 0) + 1
+-                                        count = consecutive_count[key]
+-                                        
++                                        # 增加连续出现次数（重试次数由同一张图的连续命中次数推导）
++                                        count = consecutive_count.get(key, 0) + 1
++                                        consecutive_count[key] = count
++
+                                         # 检查连续出现次数
+                                         if count == 2:
+-                                            logger.warn(f"警告：图片 {key} 已连续出现2次，开始计数重试")
+-                                            retry_count = 1
++                                            logger.warning(f"警告：图片 {key} 已连续出现2次，开始计数重试")
+                                         elif count >= 5:
+                                             logger.error(f"错误：图片 {key} 已连续出现5次，强制停止挑战")
+                                             return False
+-                                        
+-                                        # 检查重试次数
+-                                        if retry_count > 0:
+-                                            logger.info(f"重试次数：{retry_count}/5")
+-                                            if retry_count >= 5:
+-                                                logger.error(f"错误：重试5次后图片 {key} 仍然存在，结束挑战")
+-                                                return False
+-                                            retry_count += 1
++
++                                        # 重试提示：从第2次连续命中起计数，第5次在上方强制停止
++                                        if count >= 2:
++                                            logger.info(f"重试次数：{count - 1}/5")
+                                         
+                                         if info['message']:
+@@ -308,17 +320,15 @@
+                                             # 挑战开始时重置连续出现次数
+                                             consecutive_count = {}
+-                                            retry_count = 0
+                                         # 更新下一个图片
+                                         current_next_image = info['next_image']
+                                         # 重置开始时间
+                                         next_image_start_time = None
+-                                        # 如果更新了下一个图片，重置连续出现次数
++                                        # 切换到不同图片时重置连续出现次数
+                                         if current_next_image and current_next_image != key:
+                                             consecutive_count = {}
+-                                            retry_count = 0
+                                         # 识别到图片后跳出循环
+                                         break
+                                 except Exception as e:
+-                                    pass
++                                    logger.warning(f"处理图片 {matched_key} 失败: {e}")
+ 
+                 # 在两次识别之间添加随机休眠时间（暂停不计入休眠，停止则干净退出）
+
+--- a/OAT/source/huijuanshuafen/base.py
++++ b/OAT/source/huijuanshuafen/base.py
+@@ -52,5 +52,5 @@
+             logger.info(f"加载模板配置: {len(tpl)} 个")
+         except Exception as e:
+-            logger.warn(f"加载模板配置失败: {e}")
++            logger.warning(f"加载模板配置失败: {e}")
+     return tpl
+ 
+@@ -114,5 +114,5 @@
+         except Exception as e:
+             try:
+-                logger.warn(f"保存调试截图失败({tag}): {e}")
++                logger.warning(f"保存调试截图失败({tag}): {e}")
+             except Exception:
+                 pass
+@@ -222,5 +222,5 @@
+         self._missing_warned.add(name)
+         path = self.tpl_path(name)
+-        logger.warn(f"[绘卷刷分] 缺少素材: {path}，请按说明截图添加后重试")
++        logger.warning(f"[绘卷刷分] 缺少素材: {path}，请按说明截图添加后重试")
+ 
+     def find_img(self, name: str, threshold: float = None, region: Tuple = None,
+@@ -261,5 +261,5 @@
+             result = self.engine.find_template(path, threshold, region)
+         except Exception as e:
+-            logger.warn(f"模板匹配异常 {name}: {e}")
++            logger.warning(f"模板匹配异常 {name}: {e}")
+             result = None
+         if result is not None and result.found:
+@@ -294,5 +294,5 @@
+                 result = self.engine.find_template(path, threshold, region)
+             except Exception as e:
+-                logger.warn(f"模板匹配异常 {name}: {e}")
++                logger.warning(f"模板匹配异常 {name}: {e}")
+                 result = None
+             if result is not None and result.found:
+@@ -409,4 +409,8 @@
+         与 find_img 的区别：不重新截图，用于一次截图、多次匹配（OCR + 图像兜底）的场景
+         """
++        if shot is None:
++            # 截图失败（窗口失效/最小化）时必须直接返回，否则下面 shot.shape 会抛
++            # AttributeError，且调用方通常没有 try
++            return None
+         path = self.tpl_path(name)
+         if not path or not os.path.exists(path):
+
+--- a/OAT/source/huijuanshuafen/explore.py
++++ b/OAT/source/huijuanshuafen/explore.py
+@@ -63,5 +63,5 @@
+         if self.tpl_exists("jiejietupo_loho") and self.find_img("jiejietupo_loho"):
+             return True
+-        if self.tpl_exists("k28") and self.find_img("k28"):
++        if self.tpl_exists("k28") and self.find_img("k28", threshold=CHAPTER28_K28_THRESHOLD):
+             return True
+         return False
+@@ -182,5 +182,5 @@
+                     # 点击怪物后仍在地图 → 判定未进入战斗，让调用方重试
+                     if (timeout - remaining) > 5:
+-                        logger.warn("点击后5秒仍在地图，判定未进入战斗")
++                        logger.warning("点击后5秒仍在地图，判定未进入战斗")
+                         return False
+                     try:
+@@ -214,8 +214,8 @@
+             no_progress += 1.0
+             if no_progress > 15 and not saw_settlement:
+-                logger.warn("15秒无战斗进展，判定未进入战斗")
++                logger.warning("15秒无战斗进展，判定未进入战斗")
+                 return False
+ 
+-        logger.warn(f"战斗超时 ({timeout}秒)")
++        logger.warning(f"战斗超时 ({timeout}秒)")
+         return saw_settlement
+ 
+@@ -260,5 +260,5 @@
+                         return False
+                     return True
+-                logger.warn("BOSS战斗未开始，重试点击")
++                logger.warning("BOSS战斗未开始，重试点击")
+                 try:
+                     if not pause_aware_sleep(1.0):
+@@ -279,5 +279,5 @@
+                 if self._fight():
+                     return False
+-                logger.warn("小怪战斗未开始，重试点击")
++                logger.warning("小怪战斗未开始，重试点击")
+                 try:
+                     if not pause_aware_sleep(1.0):
+@@ -408,5 +408,5 @@
+         # 3轮后仍在探索内部：最后确认一次
+         if self.find_img("chuzhanxiaohao", timeout=1):
+-            logger.warn("退出探索失败，可能仍在探索内部")
++            logger.warning("退出探索失败，可能仍在探索内部")
+         elif self.find_img("title_28", timeout=1):
+             logger.info("已退出到k28标题界面")
+@@ -445,5 +445,5 @@
+         except Exception as e:
+             try:
+-                logger.warn(f"ch28取证OCR清单失败: {e}")
++                logger.warning(f"ch28取证OCR清单失败: {e}")
+             except Exception:
+                 pass
+@@ -458,5 +458,5 @@
+                               threshold=CHAPTER28_K28_THRESHOLD)
+             if r is None:
+-                logger.warn("未找到第二十八章（OCR+图像均无命中）")
++                logger.warning("未找到第二十八章（OCR+图像均无命中）")
+                 self.save_debug_shot("ch28miss")
+                 dbg = self._raw_capture()
+@@ -518,5 +518,5 @@
+                     remaining = 0.0
+         self.save_debug_shot("ch28verify")
+-        logger.warn(f"已点击第二十八章但{timeout:.0f}秒未进入标题界面 [{via}]")
++        logger.warning(f"已点击第二十八章但{timeout:.0f}秒未进入标题界面 [{via}]")
+         return False
+ 
+@@ -585,9 +585,9 @@
+                     self.start_click_count += 1
+                     if self.start_click_count >= 3:
+-                        logger.warn("连续3次点击开始失败，探索次数可能已达上限")
++                        logger.warning("连续3次点击开始失败，探索次数可能已达上限")
+                         self.start_click_count = 0
+                         break
+                 else:
+-                    logger.warn("未找到开始按钮")
++                    logger.warning("未找到开始按钮")
+                 try:
+                     if not pause_aware_sleep(2.0):
+@@ -633,5 +633,5 @@
+                 else:
+                     list_fail_streak += 1
+-                    logger.warn(f"从列表返回第28章失败 ({list_fail_streak}/3)")
++                    logger.warning(f"从列表返回第28章失败 ({list_fail_streak}/3)")
+                     if list_fail_streak >= 3:
+                         logger.error("连续3次无法从列表返回，退出探索循环")
+
+--- a/OAT/source/huijuanshuafen/huijuan.py
++++ b/OAT/source/huijuanshuafen/huijuan.py
+@@ -124,5 +124,5 @@
+ 
+         self.save_debug_shot("ch28scroll")
+-        logger.warn(f"翻页{max_scroll}次仍未找到'第二十八章'")
++        logger.warning(f"翻页{max_scroll}次仍未找到'第二十八章'")
+         return None
+ 
+@@ -175,5 +175,5 @@
+         if self.tpl_exists("jiejietupo_loho") and self.find_img("jiejietupo_loho"):
+             return "explore_list"
+-        if self.find_img("k28"):
++        if self.find_img("k28", threshold=CHAPTER28_K28_THRESHOLD):
+             return "explore_list"
+ 
+@@ -210,5 +210,5 @@
+                 pass
+             return True
+-        logger.warn("未找到探索按钮")
++        logger.warning("未找到探索按钮")
+         return False
+ 
+@@ -275,5 +275,5 @@
+         img = self._raw_capture()
+         if img is None:
+-            logger.warn("无法捕获窗口截图")
++            logger.warning("无法捕获窗口截图")
+             return False
+ 
+@@ -282,5 +282,5 @@
+             center = self._find_chapter28_scroll()
+         if center is None:
+-            logger.warn("未找到第二十八章，请确认在探索入口界面")
++            logger.warning("未找到第二十八章，请确认在探索入口界面")
+             return False
+ 
+@@ -309,6 +309,9 @@
+             if self.find_img("title_28"):
+                 return self._click_explore_button()
+-            logger.warn("点击后未检测到k28标题界面，重试")
+-            center, _ = self._find_chapter28_on(self._raw_capture())
++            logger.warning("点击后未检测到k28标题界面，重试")
++            retry_shot = self._raw_capture()
++            center = None
++            if retry_shot is not None:
++                center, _ = self._find_chapter28_on(retry_shot)
+             if center is None:
+                 break
+@@ -323,5 +326,5 @@
+                 pass
+ 
+-        logger.warn("点击第二十八章后未进入标题界面")
++        logger.warning("点击第二十八章后未进入标题界面")
+         return False
+ 
+@@ -378,5 +381,5 @@
+                 logger.info(f"突破券: {number}")
+                 return number
+-            logger.warn(f"突破券识别失败(第{attempt + 1}次，重试)")
++            logger.warning(f"突破券识别失败(第{attempt + 1}次，重试)")
+             try:
+                 if not pause_aware_sleep(1.5):
+@@ -389,5 +392,5 @@
+                 pass
+ 
+-        logger.warn("突破券识别失败")
++        logger.warning("突破券识别失败")
+         return -1
+ 
+@@ -532,5 +535,5 @@
+                 self.click_center(r.region)
+             else:
+-                logger.warn("未找到退出按钮，点击左上角兜底")
++                logger.warning("未找到退出按钮，点击左上角兜底")
+                 region = tuple(self.config.get("tansuo_quit_region", [0, 0, 120, 80]))
+                 self.click_center(region, jitter_x=5, jitter_y=5)
+@@ -545,5 +548,5 @@
+                 pass
+ 
+-        logger.warn("3次尝试仍未确认探索列表界面，继续尝试找突破入口（由入口查找决定）")
++        logger.warning("3次尝试仍未确认探索列表界面，继续尝试找突破入口（由入口查找决定）")
+         return True
+ 
+@@ -622,5 +625,5 @@
+         has_fangshou = self.tpl_exists("fangshoujilu")
+         if not (has_title or has_fangshou):
+-            logger.warn("缺少结界突破锚点素材(title/fangshoujilu)，跳过场景确认")
++            logger.warning("缺少结界突破锚点素材(title/fangshoujilu)，跳过场景确认")
+             try:
+                 if not pause_aware_sleep(3.0):
+@@ -707,5 +710,5 @@
+                     return False
+ 
+-        logger.warn("等待结界突破界面超时，请确认已进入个人突破界面")
++        logger.warning("等待结界突破界面超时，请确认已进入个人突破界面")
+         return False
+ 
+@@ -764,5 +767,5 @@
+                 logger.info("已确认退出结界突破界面")
+                 return True
+-            logger.warn(f"点击关闭后仍在突破界面，重试 ({attempt + 1}/{retries})")
++            logger.warning(f"点击关闭后仍在突破界面，重试 ({attempt + 1}/{retries})")
+             r = self.find_img("close_jiejietupo", timeout=2)
+             if r:
+@@ -909,5 +912,5 @@
+             # 1. 进入第28章（场景自适应：直接点探索 or 先点第二十八章）
+             if not self._enter_explore_28():
+-                logger.warn("进入探索失败，终止")
++                logger.warning("进入探索失败，终止")
+                 return False
+             self.explore.explore_round = 0
+@@ -916,5 +919,5 @@
+             # 2. 确保回到探索列表界面（分支A前置：在k28标题界面则点quit退出）
+             if not self._ensure_explore_list():
+-                logger.warn("无法退出探索界面，终止")
++                logger.warning("无法退出探索界面，终止")
+                 return False
+             try:
+@@ -931,5 +934,5 @@
+             entry = self._find_jiejietupo_entry()
+             if entry is None:
+-                logger.warn("未识别到结界突破入口，终止")
++                logger.warning("未识别到结界突破入口，终止")
+                 return False
+ 
+@@ -937,8 +940,8 @@
+             tickets = self._get_ticket_count()
+             if tickets < 0:
+-                logger.warn("突破券识别失败，终止")
++                logger.warning("突破券识别失败，终止")
+                 return False
+             if tickets == 0:
+-                logger.warn("突破券为0，跳过本轮突破")
++                logger.warning("突破券为0，跳过本轮突破")
+                 continue
+ 
+@@ -975,5 +978,5 @@
+         cfg_path = os.path.join(self.jiejietupo_dir, 'config.json')
+         if not os.path.exists(cfg_path):
+-            logger.warn(f"结界突破配置不存在: {cfg_path}")
++            logger.warning(f"结界突破配置不存在: {cfg_path}")
+             return False
+         try:
+@@ -981,9 +984,9 @@
+                 cfg = json.load(f)
+         except Exception as e:
+-            logger.warn(f"读取结界突破配置失败: {e}")
++            logger.warning(f"读取结界突破配置失败: {e}")
+             return False
+ 
+         logger.info(f"调用已有结界突破模式，攻破次数: {tickets}")
+-        common_challenge(
++        finished = common_challenge(
+             times=tickets,
+             config=cfg,
+@@ -994,4 +997,8 @@
+             synchronizer=getattr(self.engine, 'synchronizer', None),
+         )
++        if not finished:
++            # 突破阶段被停止或中途失败：不要进入收尾等待，否则会白等 5 分钟
++            logger.warning("结界突破未正常执行完（已停止或出错），跳过收尾关闭流程")
++            return False
+         # 收尾：等最后战斗结束 → 空白点击消结算 → 识别并点击关闭按钮（5分钟上限）
+         if not self._wait_close_after_last_battle():
+@@ -1028,5 +1035,5 @@
+         hwnd = win32gui.FindWindow(None, window_title)
+     if not hwnd:
+-        logger.warn(f"未找到窗口: {window_title}")
++        logger.warning(f"未找到窗口: {window_title}")
+         return False
+ 
+
+--- a/OAT/tools/OCRManager.py
++++ b/OAT/tools/OCRManager.py
+@@ -16,4 +16,7 @@
+         """初始化OCR管理器"""
+         self.reader = None
++        # 最近一次 find_text_offline 的匹配置信度。单独用属性暴露，
++        # 避免为了日志去改 (found, area, text) 这个三元返回签名。
++        self.last_match_confidence = 0.0
+     
+     def _init_reader(self):
+@@ -36,5 +39,6 @@
+                 self.reader = None
+     
+-    def find_text_offline(self, image_input, target_text: str, debug: bool = False, confidence_threshold: float = 0.5):
++    def find_text_offline(self, image_input, target_text: str, debug: bool = False,
++                          confidence_threshold: float = 0.5, region=None):
+         """
+         OCR：查找图片中的指定文字
+@@ -45,4 +49,6 @@
+             debug: 是否启用调试输出，默认为False
+             confidence_threshold: 置信度阈值，默认为0.5
++            region: 可选搜索区域，语义与 click_area 一致：[x1, x2, y1, y2]，
++                    坐标基于传入图像本身。用于同一画面出现多个相同文字时排除干扰
+             
+         返回:
+@@ -68,4 +74,23 @@
+             img = image_input
+ 
++        # 可选：只在 region 指定的范围内做 OCR（语义与 click_area 一致：[x1, x2, y1, y2]）
++        offset_x = 0
++        offset_y = 0
++        if region and len(region) == 4:
++            try:
++                rx1, rx2, ry1, ry2 = [int(v) for v in region]
++                h, w = img.shape[:2]
++                cx1, cx2 = max(0, min(rx1, w)), max(0, min(rx2, w))
++                cy1, cy2 = max(0, min(ry1, h)), max(0, min(ry2, h))
++                if cx2 - cx1 >= 2 and cy2 - cy1 >= 2:
++                    img = img[cy1:cy2, cx1:cx2]
++                    offset_x, offset_y = cx1, cy1
++                    if debug:
++                        logger.info(f"[OCR Debug] 限定搜索区域 {region} → 裁剪为 x:{cx1}-{cx2} y:{cy1}-{cy2}")
++                else:
++                    logger.warning(f"OCR 搜索区域无效（宽或高不足），已忽略: {region}")
++            except Exception as e:
++                logger.warning(f"OCR 搜索区域解析失败，已忽略: {region} ({e})")
++
+         # 预处理：增强对比度（有助于垂直文字识别）
+         img = cv2.convertScaleAbs(img, alpha=1.5, beta=0)  # 增强对比度
+@@ -84,4 +109,5 @@
+         text_area = None
+         real_text = None
++        self.last_match_confidence = 0.0
+ 
+         # 获取识别结果数据（RapidOCR返回的是RapidOCROutput对象）
+@@ -92,37 +118,50 @@
+             return found, text_area, real_text
+ 
++        candidates = []
+         if hasattr(results, 'txts'):
+             if debug:
+-                threshold_count = 0
+-                threshold_texts = []
+                 logger.info(f"[OCR Debug] 识别到的文字数量: {len(results.txts)}")
+ 
+-            # 遍历所有文字
++            # 收集全部候选：不能“命中第一个就返回”——同一画面可能有两个相同文字，
++            # 先命中的那个未必是要点的那一个（这正是「点错位置」的根因）。
+             for i in range(len(results.txts)):
+                 text = results.txts[i]
+-                conf = results.scores[i]
++                if target_text not in text:
++                    continue
++                conf = float(results.scores[i])
+                 box = results.boxes[i]
++                area = box.tolist() if hasattr(box, 'tolist') else box
++                if offset_x or offset_y:
++                    # 裁剪过 region：坐标还原到原图坐标系，调用方无需感知裁剪
++                    area = [[p[0] + offset_x, p[1] + offset_y] for p in area]
++                candidates.append({'text': text, 'confidence': conf, 'area': area})
++                if debug:
++                    logger.info(f"[OCR Debug] 候选: '{text}'，置信度: {conf:.4f}，区域: {area}")
+ 
+-                # 调试输出：显示识别到的文字及其置信度
+-                if debug:
+-                    box_list = box.tolist() if hasattr(box, 'tolist') else box
+-                    logger.info(f"[OCR Debug] 识别到文字: '{text}'，置信度: {conf:.4f}，区域: {box_list}")
+-                    # 检查是否达到置信度阈值
+-                    if conf >= confidence_threshold:
+-                        threshold_count += 1
+-                        threshold_texts.append({
+-                            'text': text,
+-                            'confidence': conf,
+-                            'area': box
+-                        })
++            if candidates:
++                # 选择顺序：完全相等优先 → 达到置信度阈值者优先 → 置信度最高者；
++                # 并列时保留 OCR 原始顺序（自上而下、自左而右），保证结果确定可复现。
++                exact = [c for c in candidates if c['text'].strip() == target_text.strip()]
++                pool = exact if exact else candidates
++                passed = [c for c in pool if c['confidence'] >= confidence_threshold]
++                chosen = max(passed if passed else pool, key=lambda c: c['confidence'])
++                found = True
++                text_area = chosen['area']
++                real_text = chosen['text']
++                self.last_match_confidence = float(chosen['confidence'])
+ 
+-                # 检查是否找到目标文字
+-                if target_text in text:
+-                    found = True
+-                    real_text = text
+-                    text_area = box.tolist() if hasattr(box, 'tolist') else box
+-                    if debug:
+-                        logger.info(f"[OCR Debug] 找到目标文字: '{target_text}'，匹配文字: '{text}'，置信度: {conf:.4f}")
+-                    break
++                if len(candidates) > 1:
++                    # 命中多处时把各自坐标写进日志，据此判断该收窄搜索区域还是该改目标文字
++                    logger.info(f"OCR: '{target_text}' 命中 {len(candidates)} 处，"
++                                f"选用置信度最高的一处（{chosen['confidence']:.4f}）")
++                    for idx, c in enumerate(candidates, 1):
++                        xs = [p[0] for p in c['area']]
++                        ys = [p[1] for p in c['area']]
++                        mark = '   <== 选用' if c is chosen else ''
++                        logger.info(f"    候选{idx}: '{c['text']}' conf={c['confidence']:.4f} "
++                                    f"x: {min(xs):.0f}-{max(xs):.0f}  y: {min(ys):.0f}-{max(ys):.0f}{mark}")
++                elif debug:
++                    logger.info(f"[OCR Debug] 找到目标文字: '{target_text}'，"
++                                f"匹配文字: '{real_text}'，置信度: {chosen['confidence']:.4f}")
+         else:
+             if debug:
+@@ -132,19 +171,6 @@
+         if debug:
+             logger.info(f"[OCR Debug] 总识别到 {len(results.txts)} 个文字")
+-            logger.info(f"[OCR Debug] 达到置信度阈值({confidence_threshold})的文字数量: {threshold_count}")
+-            if threshold_count > 0:
+-                logger.info(f"[OCR Debug] 达到阈值的文字详情:")
+-                for idx, item in enumerate(threshold_texts, 1):
+-                    area = item['area']
+-                    if hasattr(area, 'tolist'):
+-                        area_list = area.tolist()
+-                        x_coords = [point[0] for point in area_list]
+-                        y_coords = [point[1] for point in area_list]
+-                    else:
+-                        x_coords = [point[0] for point in area]
+-                        y_coords = [point[1] for point in area]
+-                    min_x, max_x = min(x_coords), max(x_coords)
+-                    min_y, max_y = min(y_coords), max(y_coords)
+-                    logger.info(f"  {idx}. 文字: '{item['text']}'，置信度: {item['confidence']:.4f}，区域: [x: {min_x:.1f}-{max_x:.1f}, y: {min_y:.1f}-{max_y:.1f}]")
++            passed_n = len([c for c in candidates if c['confidence'] >= confidence_threshold])
++            logger.info(f"[OCR Debug] 达到置信度阈值({confidence_threshold})的候选数: {passed_n}")
+ 
+         return found, text_area, real_text
+
+--- a/OAT/tools/OnmyojiAuto.py
++++ b/OAT/tools/OnmyojiAuto.py
+@@ -243,5 +243,6 @@
+         return False
+     
+-    def find_text_ocr(self, target_text: str) -> tuple:
++    def find_text_ocr(self, target_text: str, region: list = None,
++                      confidence_threshold: float = None) -> tuple:
+         """
+         使用OCR识别文字（异步执行）
+@@ -249,8 +250,13 @@
+         参数:
+             target_text: 要识别的目标文字
++            region: 可选搜索区域，客户区坐标 [x1, x2, y1, y2]（与 click_area 同语义）。
++                    同一画面出现多个相同文字时，用它排除不需要的那一个
++            confidence_threshold: 可选，OCR 置信度阈值；None 时用 OCR 侧默认值
+             
+         返回:
+             tuple: (是否找到, 文字区域坐标, 文字内容)
+         """
++        if confidence_threshold is None:
++            confidence_threshold = 0.5
+         import queue
+         
+@@ -287,7 +293,32 @@
+                     result_queue.put((False, None, None))
+                     return
+-                
++
++                # 截图坐标 → 客户区坐标的偏移量。必须在 OCR 之前算好：
++                # ocr_region 用客户区坐标描述，要先换算成截图坐标才能裁剪。
++                # （截图含标题栏时偏移为标题栏高度；纯客户区截图偏移为 0）
++                dy = 0
++                if self.hwnd:
++                    try:
++                        window_rect, client_rect = self._get_cached_window_rect()
++                        window_height = window_rect[3] - window_rect[1]
++                        client_height = client_rect[3] - client_rect[1]
++                        dy = effective_client_dy(screenshot.shape[0], client_height,
++                                                 window_height - client_height)
++                    except Exception:
++                        dy = 0
++
++                # ocr_region 是客户区坐标，换算到截图坐标后交给 OCR 裁剪
++                shot_region = None
++                if region and len(region) == 4:
++                    try:
++                        rx1, rx2, ry1, ry2 = [int(v) for v in region]
++                        shot_region = [rx1, rx2, ry1 + dy, ry2 + dy]
++                    except Exception:
++                        shot_region = None
++
+                 # 使用OCR服务识别文字
+-                found, text_area, real_text = ocr_service.find_text(screenshot, target_text)
++                found, text_area, real_text = ocr_service.find_text(
++                    screenshot, target_text,
++                    confidence_threshold=confidence_threshold, region=shot_region)
+                 
+                 # 记录识别时间（仅在找到文字时打印）
+@@ -296,24 +327,8 @@
+                     logger.info(f"OCR识别成功: '{target_text}'，耗时: {elapsed_time:.3f}秒")
+                     
+-                    # 如果有窗口句柄，将截图坐标转换为客户区坐标
+-                    # （截图含标题栏时减去标题栏高度；纯客户区截图偏移为0）
++                    # 将截图坐标转换为客户区坐标（偏移量上面已算好，复用同一个 dy）
+                     if self.hwnd and text_area:
+                         try:
+-                            # 获取窗口信息（使用缓存）
+-                            window_rect, client_rect = self._get_cached_window_rect()
+-
+-                            # 计算标题栏高度（窗口高度 - 客户区高度）
+-                            window_height = window_rect[3] - window_rect[1]
+-                            client_height = client_rect[3] - client_rect[1]
+-                            title_bar_height = window_height - client_height
+-                            dy = effective_client_dy(screenshot.shape[0], client_height, title_bar_height)
+-                            
+-                            # 将截图坐标转换为客户区坐标
+-                            converted_text_area = []
+-                            for point in text_area:
+-                                x, y = point
+-                                converted_text_area.append([x, y - dy])
+-                            
+-                            text_area = converted_text_area
++                            text_area = [[x, y - dy] for x, y in text_area]
+                         except Exception:
+                             # 如果转换失败，使用原始坐标
+@@ -395,4 +410,6 @@
+                        ocr_target_text: str = "",
+                        ocr_action: str = "",
++                       ocr_region: list = None,
++                       ocr_confidence_threshold: float = None,
+                        # sync_type: str = "完全同步"
+                        ) -> bool:
+@@ -407,4 +424,6 @@
+         :param ocr_enabled: 是否启用OCR识别
+         :param ocr_target_text: OCR目标文字
++        :param ocr_region: OCR搜索区域，客户区坐标 [x1, x2, y1, y2]；用于排除同名的其他文字
++        :param ocr_confidence_threshold: OCR置信度阈值
+         :param sync_type: 同步类型，可选值："完全同步"、"点击同步"
+         :return: 是否成功执行操作
+@@ -418,5 +437,7 @@
+             if ocr_enabled and ocr_target_text and not self._should_skip_ocr_for_custom_area(
+                     ocr_enabled, ocr_target_text, ocr_action, click_type, click_area):
+-                found, text_area, real_text = self.find_text_ocr(ocr_target_text)
++                found, text_area, real_text = self.find_text_ocr(
++                    ocr_target_text, region=ocr_region,
++                    confidence_threshold=ocr_confidence_threshold)
+                 if found and text_area:
+                     # 在文字区域内随机点击
+
+--- a/OAT/tools/WindowChecker.py
++++ b/OAT/tools/WindowChecker.py
+@@ -34,4 +34,22 @@
+         self.window_handle = hwnd
+ 
++    def _resolve_hwnd(self) -> int:
++        """解析出当前可用的窗口句柄
++
++        缓存的句柄可能已失效（游戏/模拟器窗口被关闭或重建后会重新分配句柄），
++        这里用 IsWindow 校验；失效则丢弃缓存并按标题重新查找。
++        """
++        if self.window_handle:
++            try:
++                if win32gui.IsWindow(self.window_handle):
++                    return self.window_handle
++            except Exception:
++                pass
++            logger.warning('缓存的窗口句柄已失效，按窗口标题重新获取')
++            self.window_handle = None
++        if self.window_title:
++            return win32gui.FindWindow(None, self.window_title) or 0
++        return 0
++
+     def get_window_info(self) -> Optional[Tuple[Tuple[int, int], Tuple[int, int], Tuple[int, int]]]:
+         """
+@@ -43,11 +61,15 @@
+             return None
+ 
+-        if not self.window_handle:
+-            hwnd = win32gui.FindWindow(None, self.window_title)
+-        else:
+-            hwnd = self.window_handle
++        hwnd = self._resolve_hwnd()
+ 
+         if hwnd:
+-            rect = win32gui.GetWindowRect(hwnd)
++            try:
++                rect = win32gui.GetWindowRect(hwnd)
++            except pywintypes.error as e:
++                # 句柄可能在取值前的一瞬间被销毁（窗口关闭/模拟器重启）。
++                # 这里必须返回 None 而不是抛异常：本方法会被 main_window 的定时器
++                # 回调调用，抛出去会变成每轮一次的未捕获异常（曾刷屏 (1400, ...)）。
++                logger.warning(f'获取窗口位置失败，窗口可能已关闭: {e}')
++                return None
+             left, top, right, bottom = rect
+             width = right - left
+@@ -66,26 +88,76 @@
+             return None
+ 
+-        if not self.window_handle:
+-            hwnd = win32gui.FindWindow(None, self.window_title)
+-        else:
+-            hwnd = self.window_handle
++        hwnd = self._resolve_hwnd()
+ 
+         if hwnd:
+-            # 获取客户区域矩形（相对于窗口内部）
+-            client_rect = win32gui.GetClientRect(hwnd)
+-            client_left, client_top, client_right, client_bottom = client_rect
+-            client_width = client_right - client_left
+-            client_height = client_bottom - client_top
+-            
+-            # 将客户区域左上角转换为屏幕坐标
+-            client_screen_left, client_screen_top = win32gui.ClientToScreen(hwnd, (client_left, client_top))
+-            # 将客户区域右下角转换为屏幕坐标
+-            client_screen_right, client_screen_bottom = win32gui.ClientToScreen(hwnd, (client_right, client_bottom))
+-            
++            try:
++                # 获取客户区域矩形（相对于窗口内部）
++                client_rect = win32gui.GetClientRect(hwnd)
++                client_left, client_top, client_right, client_bottom = client_rect
++                client_width = client_right - client_left
++                client_height = client_bottom - client_top
++
++                # 将客户区域左上角转换为屏幕坐标
++                client_screen_left, client_screen_top = win32gui.ClientToScreen(hwnd, (client_left, client_top))
++                # 将客户区域右下角转换为屏幕坐标
++                client_screen_right, client_screen_bottom = win32gui.ClientToScreen(hwnd, (client_right, client_bottom))
++            except pywintypes.error as e:
++                # 与 get_window_info 同理：窗口消失时返回 None，不把异常抛给调用方
++                logger.warning(f'获取客户区信息失败，窗口可能已关闭: {e}')
++                return None
++
+             return (client_screen_left, client_screen_top), (client_screen_right, client_screen_bottom), (client_width, client_height)
+         logger.error('未找到指定客户端窗口')
+         return None
+ 
++    def _get_client_size(self, hwnd: int) -> Tuple[int, int]:
++        """客户区（游戏画面）尺寸；失败返回 (0, 0)"""
++        try:
++            r = win32gui.GetClientRect(hwnd)
++            return (r[2] - r[0], r[3] - r[1])
++        except Exception:
++            return (0, 0)
++
++    def _outer_size_for_client(self, hwnd: int, client_w: int, client_h: int):
++        """把「客户区尺寸」换算成「窗口外框尺寸」（含标题栏/边框）；失败返回 None"""
++        try:
++            import ctypes
++            from ctypes import wintypes
++            gwl_style = getattr(win32con, 'GWL_STYLE', -16)
++            gwl_exstyle = getattr(win32con, 'GWL_EXSTYLE', -20)
++            style = win32gui.GetWindowLong(hwnd, gwl_style)
++            exstyle = win32gui.GetWindowLong(hwnd, gwl_exstyle)
++            rect = wintypes.RECT(0, 0, int(client_w), int(client_h))
++            if not ctypes.windll.user32.AdjustWindowRectEx(
++                    ctypes.byref(rect), style, False, exstyle):
++                return None
++            return (rect.right - rect.left, rect.bottom - rect.top)
++        except Exception as e:
++            logger.error(f'换算窗口外框尺寸失败: {e}')
++            return None
++
++    def log_size_pair(self, hwnd: int, target_width: int, target_height: int) -> None:
++        """把「外框」和「客户区」两个尺寸都记下来
++
++        以前只记一个数、还标成“客户端大小”，实际是 GetWindowRect 的外框尺寸，
++        于是同一件事出现两个数字、模板该按哪个尺寸截也说不清。
++        """
++        try:
++            wr = win32gui.GetWindowRect(hwnd)
++            win_w, win_h = wr[2] - wr[0], wr[3] - wr[1]
++            cw, ch = self._get_client_size(hwnd)
++            logger.info(f'窗口尺寸：外框 {win_w}x{win_h}，客户区 {cw}x{ch}'
++                        f'（目标客户区 {target_width}x{target_height}）'
++                        f'—— 模板图与截图都以【客户区】为准')
++        except Exception:
++            pass
++
+     def resize_window(self, width: int, height: int, hwnd: Optional[int] = None):
++        """把「客户区」调整为 width x height（内部换算成窗口外框尺寸再设置）
++
++        注意：参数是客户区（游戏画面）尺寸，不是窗口外框尺寸。
++        原实现直接把它当外框尺寸传给 SetWindowPos，导致客户区永远比目标小一截
++        （标题栏 + 边框），而且与「客户区目标」比较时永远不相等、反复调整。
++        """
+         try:
+             if not hwnd:
+@@ -101,5 +173,14 @@
+                 # 添加异常处理，处理可能的访问拒绝错误
+                 try:
+-                    win32gui.SetWindowPos(hwnd, win32con.HWND_TOP, 0, 0, width, height, win32con.SWP_NOMOVE)
++                    outer = self._outer_size_for_client(hwnd, width, height)
++                    if outer:
++                        logger.info(f'调整窗口：目标客户区 {width}x{height}'
++                                    f' → 窗口外框 {outer[0]}x{outer[1]}')
++                        win32gui.SetWindowPos(hwnd, win32con.HWND_TOP, 0, 0,
++                                              outer[0], outer[1], win32con.SWP_NOMOVE)
++                    else:
++                        # 换算失败时退回旧行为（按外框尺寸设置），至少不会完全不动作
++                        logger.warning('无法换算外框尺寸，按窗口外框尺寸直接设置（客户区会偏小）')
++                        win32gui.SetWindowPos(hwnd, win32con.HWND_TOP, 0, 0, width, height, win32con.SWP_NOMOVE)
+                     return True
+                 except pywintypes.error as e:
+@@ -116,6 +197,49 @@
+             return False
+ 
+-    def connect_all(self, target_width: int = 1404, target_height: int = 834) -> None:
+-        """执行完整窗口连接流程"""
++    @staticmethod
++    def _size_close(a, b, tol: int = 2) -> bool:
++        """尺寸是否"够接近"（模拟器常返回 ±1~2px 抖动，精确相等会误判为失败）"""
++        try:
++            return abs(int(a[0]) - int(b[0])) <= tol and abs(int(a[1]) - int(b[1])) <= tol
++        except Exception:
++            return False
++
++    def _nearest_achievable_size(self, hwnd: int, target_w: int, target_h: int,
++                                 actual_w: int, actual_h: int):
++        """当目标客户区尺寸被窗口/模拟器拒绝时，推算一个"最接近且可达"的尺寸。
++
++        典型场景：MuMu 模拟器锁定 16:9 宽高比，而配置里的 1404x834 是 1.684，
++        永远达不到 —— 会出现「高度对、宽度多 76」和「宽度对、高度少 43」来回横跳。
++        这里按实测到的真实宽高比，取面积最接近目标的可达尺寸。
++        """
++        if actual_w <= 0 or actual_h <= 0:
++            return (actual_w, actual_h)
++        aspect = actual_w / actual_h          # 实测比例（如 16:9 ≈ 1.7778）
++        target_area = target_w * target_h
++        # 以目标面积反推该比例下的尺寸，再对齐到偶数（避免半像素抖动）
++        h = int(round((target_area / aspect) ** 0.5))
++        w = int(round(h * aspect))
++        w -= w % 2
++        h -= h % 2
++        if w <= 0 or h <= 0:
++            return (actual_w, actual_h)
++        return (w, h)
++
++    def connect_all(self, target_width: int = None, target_height: int = None) -> None:
++        """执行完整窗口连接流程
++
++        target_width/height 为 None 时读取用户在设置里的「自定义分辨率」
++        （custom_res_width / custom_res_height）。旧实现是硬编码 1404x834 无参调用，
++        用户改了设置也不生效。
++        """
++        if target_width is None or target_height is None:
++            try:
++                from OAT.tools import settings as _s
++                sd = getattr(_s, 'settings_data', {}) or {}
++                target_width = int(sd.get('custom_res_width', 1404))
++                target_height = int(sd.get('custom_res_height', 834))
++                logger.info(f'窗口目标尺寸取自设置：{target_width}x{target_height}')
++            except Exception:
++                target_width, target_height = 1404, 834
+         if not self.window_title:
+             logger.error('窗口标题未设置')
+@@ -147,22 +271,77 @@
+             logger.info('窗口处于最小化状态，已自动恢复窗口后继续检测')
+ 
+-        current_size = self.get_window_info()
+-        if current_size:
+-            current_width, current_height = current_size[2]
+-            if current_width != target_width or current_height != target_height:
+-                # 尝试调整窗口大小，但不强制要求成功（结果以后续实际尺寸为准）
+-                self.resize_window(target_width, target_height)
+-                
+-                # 检查调整后的尺寸
+-                updated_size = self.get_window_info()
+-                if updated_size and (updated_size[2][0] != target_width or updated_size[2][1] != target_height):
+-                    # 导入必要的模块用于弹窗
++        # 比较与调整一律以【客户区】为准：模板图、截图、点击坐标全是客户区坐标系。
++        # 旧版用 get_window_info()（GetWindowRect 外框尺寸）既比较又报告，
++        # 却标成“客户端大小”，于是同一件事出现两个数字、且永远与客户区目标不等。
++        self.log_size_pair(hwnd, target_width, target_height)
++
++        client_w, client_h = self._get_client_size(hwnd)
++        if hwnd and (client_w, client_h) != (target_width, target_height):
++            # 尝试调整窗口大小，但不强制要求成功（结果以后续实际尺寸为准）
++            self.resize_window(target_width, target_height, hwnd=hwnd)
++
++            # 窗口尺寸变化后系统需要一点时间生效：立即复测会读到旧值，
++            # 旧版因此每次点都拿到不同的数、反复提示“调整失败”。
++            deadline = time.time() + 2.0
++            while time.time() < deadline:
++                time.sleep(0.15)
++                if self._get_client_size(hwnd) == (target_width, target_height):
++                    break
++
++            client_w, client_h = self._get_client_size(hwnd)
++            self.log_size_pair(hwnd, target_width, target_height)
++
++            if not self._size_close((client_w, client_h), (target_width, target_height)):
++                # 目标不可达：判断是不是被强制锁定宽高比（模拟器常见）。
++                # 若是，直接吸附到最接近的可达尺寸并【接受】，不再反复调整 ——
++                # 否则每次点「窗口检测」都会在两个尺寸间来回横跳，模板永远对不上。
++                near_w, near_h = self._nearest_achievable_size(
++                    hwnd, target_width, target_height, client_w, client_h)
++                if not self._size_close((near_w, near_h), (client_w, client_h)):
++                    logger.info(f'目标客户区 {target_width}x{target_height} 被拒绝，'
++                                f'按实测比例吸附到最接近的可达尺寸 {near_w}x{near_h}')
++                    self.resize_window(near_w, near_h, hwnd=hwnd)
++                    deadline = time.time() + 2.0
++                    while time.time() < deadline:
++                        time.sleep(0.15)
++                        if self._size_close(self._get_client_size(hwnd), (near_w, near_h)):
++                            break
++                    client_w, client_h = self._get_client_size(hwnd)
++                    self.log_size_pair(hwnd, target_width, target_height)
++
++                # 仍然达不到目标：把「实际可达尺寸」写回设置，让它成为新的目标。
++                # 这样下一次检测 target == 实际，不再反复弹窗，用户也不必手动改设置。
++                # 这正是「自动调整到它需要的分辨率」——只是把结果固化下来。
++                if not self._size_close((client_w, client_h), (target_width, target_height)):
++                    aspect_now = round(client_w / client_h, 4) if client_h else 0
++                    logger.warning(
++                        f'窗口被锁定宽高比（实测 {aspect_now}，16:9 = 1.7778），'
++                        f'{target_width}x{target_height} 达不到；'
++                        f'已自动采用可达尺寸 {client_w}x{client_h} 并写回设置')
+                     try:
+-                        warning_box(f"窗口尺寸调整失败，当前尺寸：{updated_size[2]}。\n请手动调整窗口大小为{target_width}x{target_height}，或检查窗口是否被其他程序占用。")
++                        from OAT.tools import settings as _s
++                        _s.update_settings('custom_res_width', int(client_w))
++                        _s.update_settings('custom_res_height', int(client_h))
++                        logger.info(f'已将自定义分辨率更新为 {client_w}x{client_h}，'
++                                    f'后续检测不会再提示')
++                    except Exception as e:
++                        logger.error(f'写回自定义分辨率失败: {e}')
++
++                    # 只在“吸附后仍不稳定”时提示一次；写回设置后下次不会再来
++                    try:
++                        warning_box(
++                            f"窗口客户区达不到 {target_width}x{target_height}"
++                            f"（该窗口锁定宽高比 {aspect_now}，16:9 = 1.7778）。\n\n"
++                            f"已自动改用可达尺寸 {client_w}x{client_h} 并记入设置，"
++                            f"以后不会再提示。\n\n"
++                            f"请注意：模板图必须在这个尺寸（{client_w}x{client_h}）下重新截图，"
++                            f"否则识别会失败。"
++                        )
+                     except Exception as e:
+                         logger.error(f"显示弹窗失败: {e}")
+-                    # 如果已提供了窗口句柄，仍然继续运行
+-                    if not self.window_handle:
+-                        return
+-
+-
++                # 已提供窗口句柄时继续运行（按当前实际尺寸跑）
++                if not self.window_handle:
++                    return
++
++
++
+
+--- a/OAT/tools/edit_mode_and_img.py
++++ b/OAT/tools/edit_mode_and_img.py
+@@ -3,4 +3,5 @@
+ import ast
+ import shutil
++import time
+ from PyQt6 import QtCore, QtGui, QtWidgets
+ from PyQt6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QTreeWidget, QTreeWidgetItem, QPushButton, QLineEdit, QLabel, QFileDialog, QListWidget, QListWidgetItem, QMessageBox, QSplitter
+@@ -56,4 +57,37 @@
+         return None
+     return area
++
++
++def _normalize_area(raw):
++    """把区域值规整成 [x1, x2, y1, y2]；非法返回 None。
++
++    config.json 里存的是 list（如 [300, 438, 500, 561]），而 GUI 输入框里是
++    str（如 "[300, 438, 500, 561]"）。两种来源都要能处理 —— 只认 str 会导致
++    从配置读出来的 list 被当成非法而静默丢弃。
++    """
++    if raw is None:
++        return None
++    if isinstance(raw, str):
++        return _parse_click_area(raw)
++    try:
++        area = [int(x) for x in raw]
++    except (ValueError, TypeError):
++        return None
++    if len(area) != 4 or area[0] > area[1] or area[2] > area[3]:
++        return None
++    return area
++
++
++def _normalize_wait(raw):
++    """把等待秒数规整成非负 float；非法/缺省返回 None（调用方按默认处理）。"""
++    if raw is None or raw == "":
++        return None
++    try:
++        v = float(raw)
++    except (ValueError, TypeError):
++        return None
++    if v < 0:
++        return None
++    return v
+ 
+ 
+@@ -127,4 +161,17 @@
+     task = {"name": name, "template": data.get("path", name + ".png")}
+ 
++    # 点击后随机等待（每张图独立，留空则运行时按默认 0.3~5）
++    _cw_min = _normalize_wait(data.get("click_wait_min"))
++    _cw_max = _normalize_wait(data.get("click_wait_max"))
++    if _cw_min is not None or _cw_max is not None:
++        if _cw_min is None:
++            _cw_min = 0.3
++        if _cw_max is None:
++            _cw_max = 5.0
++        if _cw_max < _cw_min:
++            _cw_min, _cw_max = _cw_max, _cw_min
++        task["click_wait_min"] = _cw_min
++        task["click_wait_max"] = _cw_max
++
+     if data.get("is_challenge_start"):
+         task["is_start"] = True
+@@ -142,4 +189,7 @@
+     ocr_enabled = data.get("ocr_enabled", False)
+     ocr_text = (data.get("ocr_target_text") or "").strip()
++    # OCR 搜索区域（可选）：限定 OCR 只在该区域内找文字，用于排除同页出现的
++    # 相同文字。语义与 click_area 一致 [x1, x2, y1, y2]（客户区坐标）。
++    ocr_region = _normalize_area(data.get("ocr_region"))
+     # 逆向转换会把原始 recognition 存下来（审批：接受冗余字段），优先还原纯 ocr 模式
+     if data.get("recognition") == "ocr" and ocr_text:
+@@ -150,4 +200,6 @@
+         except (ValueError, TypeError):
+             task["ocr_confidence"] = 0.8
++        if ocr_region:
++            task["ocr_region"] = ocr_region
+     elif ocr_enabled and ocr_text:
+         task["recognition"] = "template+ocr"
+@@ -157,4 +209,6 @@
+         except (ValueError, TypeError):
+             task["ocr_confidence"] = 0.8
++        if ocr_region:
++            task["ocr_region"] = ocr_region
+ 
+     click_area = data.get("click_area")
+@@ -254,4 +308,18 @@
+         data["ocr_target_text"] = ""
+         data["ocr_confidence_threshold"] = 0.8
++    # OCR 搜索区域：往返必须保留，否则「截图添加」记录的位置在保存/重开后丢失
++    _rr = task.get("ocr_region")
++    if _rr and len(_rr) == 4:
++        try:
++            data["ocr_region"] = [int(v) for v in _rr]
++        except (ValueError, TypeError):
++            pass
++    # 点击后随机等待：往返保留
++    _cw_min = _normalize_wait(task.get("click_wait_min"))
++    _cw_max = _normalize_wait(task.get("click_wait_max"))
++    if _cw_min is not None:
++        data["click_wait_min"] = _cw_min
++    if _cw_max is not None:
++        data["click_wait_max"] = _cw_max
+     data["ocr_action"] = "点击文字所在区域"
+ 
+@@ -462,4 +530,20 @@
+         click_area_layout.addLayout(duration_layout)
+ 
++        # 点击后随机等待（秒）：每张图可单独设置，点击后在此区间随机等待。
++        # 用于模拟人工节奏，避免固定间隔被判定为脚本。
++        click_wait_layout = QHBoxLayout()
++        click_wait_label = QLabel("点击后随机等待(秒):")
++        self.click_wait_min_edit = QLineEdit(str(self.config_data.get("click_wait_min", 0.3)))
++        self.click_wait_min_edit.setFixedWidth(60)
++        self.click_wait_max_edit = QLineEdit(str(self.config_data.get("click_wait_max", 5.0)))
++        self.click_wait_max_edit.setFixedWidth(60)
++        click_wait_layout.addWidget(click_wait_label)
++        click_wait_layout.addWidget(self.click_wait_min_edit)
++        click_wait_layout.addWidget(QLabel("~"))
++        click_wait_layout.addWidget(self.click_wait_max_edit)
++        click_wait_layout.addWidget(QLabel("（默认 0.3~5，留空按默认）"))
++        click_wait_layout.addStretch()
++        click_area_layout.addLayout(click_wait_layout)
++
+         main_layout.addWidget(click_area_group)
+         
+@@ -482,5 +566,5 @@
+         
+         # OCR识别阈值
+-        ocr_threshold_layout = QHBoxLayout()
++        ocr_threshold_layout = QtWidgets.QHBoxLayout()
+         ocr_threshold_label = QLabel("OCR识别阈值:")
+         self.ocr_threshold_edit = QLineEdit(str(self.config_data.get("ocr_confidence_threshold", 0.8)))
+@@ -488,4 +572,14 @@
+         ocr_threshold_layout.addWidget(self.ocr_threshold_edit)
+         ocr_layout.addLayout(ocr_threshold_layout)
++        
++        # OCR搜索区域（可选）：同一画面出现多个相同文字时，用区域把干扰的那一个排除掉
++        ocr_region_layout = QtWidgets.QHBoxLayout()
++        ocr_region_label = QLabel("OCR搜索区域:")
++        _ocr_region_val = self.config_data.get("ocr_region")
++        self.ocr_region_edit = QLineEdit("" if not _ocr_region_val else str(list(_ocr_region_val)))
++        self.ocr_region_edit.setPlaceholderText("可选，[x1, x2, y1, y2]，留空 = 全窗口")
++        ocr_region_layout.addWidget(ocr_region_label)
++        ocr_region_layout.addWidget(self.ocr_region_edit)
++        ocr_layout.addLayout(ocr_region_layout)
+         
+         # OCR识别后的操作
+@@ -594,4 +688,26 @@
+             action_type = "click"
+         self.config_data["action_type"] = action_type
++
++        # 点击后随机等待（每张图独立配置）。两个框都留空 => 移除该字段，运行时按默认 0.3~5。
++        # 只填一个时，另一个按默认补；写反了自动交换。
++        _cw_min_raw = self.click_wait_min_edit.text().strip()
++        _cw_max_raw = self.click_wait_max_edit.text().strip()
++        if not _cw_min_raw and not _cw_max_raw:
++            self.config_data.pop("click_wait_min", None)
++            self.config_data.pop("click_wait_max", None)
++        else:
++            try:
++                _cw_min = float(_cw_min_raw) if _cw_min_raw else 0.3
++                _cw_max = float(_cw_max_raw) if _cw_max_raw else 5.0
++            except (ValueError, TypeError):
++                QMessageBox.warning(self, "警告", "点击后随机等待格式非法，应为数字（单位秒）")
++                return
++            if _cw_min < 0 or _cw_max < 0:
++                QMessageBox.warning(self, "警告", "点击后随机等待不能为负数")
++                return
++            if _cw_max < _cw_min:
++                _cw_min, _cw_max = _cw_max, _cw_min
++            self.config_data["click_wait_min"] = _cw_min
++            self.config_data["click_wait_max"] = _cw_max
+ 
+         if action_type == "wait":
+@@ -666,4 +782,15 @@
+         self.config_data["ocr_confidence_threshold"] = _normalize_confidence(self.ocr_threshold_edit.text())
+         
++        # OCR搜索区域（可选，与 click_area 同语义：[x1, x2, y1, y2]；留空则移除该字段）
++        _ocr_region_raw = self.ocr_region_edit.text().strip()
++        _ocr_region = _parse_click_area(_ocr_region_raw) if _ocr_region_raw else None
++        if _ocr_region_raw and not _ocr_region:
++            QMessageBox.warning(self, "警告", "OCR搜索区域格式不对，应为 [x1, x2, y1, y2]")
++            return
++        if _ocr_region:
++            self.config_data["ocr_region"] = _ocr_region
++        else:
++            self.config_data.pop("ocr_region", None)
++        
+         # OCR识别后的操作（仅 click 类型需要点击区域校验；swipe/wait 自带动作语义）
+         self.config_data["ocr_action"] = self.ocr_action_combo.currentText()
+@@ -874,13 +1001,21 @@
+         img_buttons_layout = QHBoxLayout()
+         self.add_img_btn = QPushButton("添加图像")
++        self.capture_img_btn = QPushButton("截图添加")
++        self.capture_img_btn.setToolTip(
++            "后台抓取游戏窗口画面并框选，截图尺寸与识别时一致，最适合做模板")
+         self.delete_img_btn = QPushButton("删除图像")
+         self.replace_img_btn = QPushButton("替换图片")
+         self.replace_img_btn.setToolTip("选中一张图，从资源管理器选新图直接覆盖，文件名和配置不变")
++        self.capture_replace_img_btn = QPushButton("截图替换")
++        self.capture_replace_img_btn.setToolTip(
++            "选中一张图，直接框选游戏画面覆盖它，文件名和配置不变（不用先存文件再选）")
+         self.edit_img_config_btn = QPushButton("编辑图像配置")
+         self.usage_instructions_btn = QPushButton("查看使用说明")
+ 
+         img_buttons_layout.addWidget(self.add_img_btn)
++        img_buttons_layout.addWidget(self.capture_img_btn)
+         img_buttons_layout.addWidget(self.delete_img_btn)
+         img_buttons_layout.addWidget(self.replace_img_btn)
++        img_buttons_layout.addWidget(self.capture_replace_img_btn)
+         img_buttons_layout.addWidget(self.edit_img_config_btn)
+         img_buttons_layout.addWidget(self.usage_instructions_btn)
+@@ -940,6 +1075,8 @@
+         # 图像操作按钮
+         self.add_img_btn.clicked.connect(self.add_image)
++        self.capture_img_btn.clicked.connect(self.capture_and_add_image)
+         self.delete_img_btn.clicked.connect(self.delete_image)
+         self.replace_img_btn.clicked.connect(self.replace_image)
++        self.capture_replace_img_btn.clicked.connect(self.capture_replace_image)
+         self.edit_img_config_btn.clicked.connect(self.edit_image_config)
+         self.usage_instructions_btn.clicked.connect(self.show_usage_instructions)
+@@ -1272,4 +1409,133 @@
+                 QMessageBox.warning(self, "警告", "模式对应的目录名未设置")
+     
++    def capture_and_add_image(self):
++        """截图添加：后台抓游戏窗口 → 框选 → 存成模板并弹出配置对话框
++
++        与「添加图像」的区别：不用先去别处截图再选文件，直接在 OAT 里框选。
++        因为抓的是游戏窗口客户区，**截出来的尺寸就是识别时用的尺寸**，
++        不会出现「模板在 A 尺寸下截、运行时是 B 尺寸」导致的匹配失败。
++        """
++        mode_path = self._get_current_mode_path()
++        if not mode_path:
++            QMessageBox.warning(self, "警告", "请选择一个模式")
++            return
++        dir_name = self._resolve_dir_name(mode_path)
++        if not dir_name:
++            QMessageBox.warning(self, "警告", "模式对应的目录名未设置")
++            return
++
++        mode_dir = os.path.join(self.source_dir, dir_name)
++        if not os.path.exists(mode_dir):
++            os.makedirs(mode_dir)
++
++        # 取当前选中的客户端窗口（与主界面一致）
++        hwnd, title = self._current_game_window()
++
++        from OAT.tools.region_capture import capture_region_from_window, save_crop
++
++        # 注意：这个工具自己弹遮罩完成交互，构造返回时结果就已就绪，
++        # 不能对它 exec()（会弹出一个空白对话框并卡住）。
++        crop, crop_rect, capture_size = capture_region_from_window(
++            self, hwnd=hwnd, window_title=title)
++        if crop is None:
++            return
++
++        # 生成不重名的文件名
++        base = "shot_" + time.strftime("%Y%m%d-%H%M%S")
++        filename = base + ".png"
++        n = 1
++        while os.path.exists(os.path.join(mode_dir, filename)):
++            filename = f"{base}_{n}.png"
++            n += 1
++        dest_path = os.path.join(mode_dir, filename)
++
++        if not save_crop(crop, dest_path):
++            QMessageBox.warning(self, "警告", f"保存截图失败: {dest_path}")
++            return
++
++        w, h = crop.shape[1], crop.shape[0]
++        cap = capture_size or (0, 0)
++
++        # 框选位置 (x, y, w, h) 就是客户区坐标，和识别/点击用的是同一套坐标系，
++        # 所以可以直接换算成配置里的区域格式 [x1, x2, y1, y2] 预填进去，
++        # 省得用户再去猜坐标。这是「截图时记录位置」的核心。
++        initial_cfg = {}
++        if crop_rect:
++            rx, ry, rw, rh = crop_rect
++            box = [int(rx), int(rx + rw), int(ry), int(ry + rh)]
++            # ocr_region 是纯约束（留空=全窗口），预填不会改变默认行为，
++            # 正好用来解决"同页两处相同文字点错位置"的问题。
++            initial_cfg["ocr_region"] = box
++            # click_area 只作为参考值展示；显式写 click_type=image，
++            # 避免因为带了 click_area 就把默认点击方式悄悄切成"自定义区域"。
++            initial_cfg["click_area"] = box
++            initial_cfg["click_type"] = "image"
++            logger.info(f"截图添加：{filename}  {w}x{h}  @({rx},{ry})  "
++                        f"来自窗口画面 {cap[0]}x{cap[1]}  区域[x1,x2,y1,y2]={box}")
++        else:
++            logger.info(f"截图添加：{filename}  {w}x{h}  来自窗口画面 {cap[0]}x{cap[1]}")
++
++        # 尺寸提醒：模板必须和识别时的窗口尺寸一致
++        if cap[0] and (w > cap[0] or h > cap[1]):
++            QMessageBox.warning(self, "警告", "截图尺寸异常，请重新截图")
++
++        self.load_images(mode_path)
++
++        # 选中新图并弹出配置对话框（与 add_image 行为一致）
++        config_path = os.path.join(mode_dir, 'config.json')
++        for i in range(self.img_list.count()):
++            item = self.img_list.item(i)
++            if item.text() == filename:
++                self.img_list.setCurrentItem(item)
++                break
++
++        image_list = [self.img_list.item(i).text() for i in range(self.img_list.count())]
++        # 把记录下来的位置作为初始配置带进对话框（用户可直接看到/修改）
++        cfg = ImageConfigDialog(self, filename, initial_cfg, config_path, image_list)
++        if cfg.exec() == QDialog.DialogCode.Accepted:
++            new_name = cfg.name_line_edit.text()
++            if new_name and new_name != filename:
++                try:
++                    os.rename(os.path.join(mode_dir, filename),
++                              os.path.join(mode_dir, new_name))
++                except Exception as e:
++                    QMessageBox.warning(self, "警告", f"重命名文件失败: {e}")
++            self.load_images(mode_path)
++
++    def _current_game_window(self):
++        """尽力取到当前游戏窗口的 (hwnd, title)。
++
++        编辑器是独立对话框，拿不到主界面的选中项时回落到 client.json 里的标题。
++        """
++        # 1) 主界面窗口上的选中句柄
++        try:
++            mw = self.parent()
++            for _ in range(4):
++                if mw is None:
++                    break
++                hwnd = getattr(mw, 'selected_hwnd', None)
++                title = getattr(mw, 'window_title', None)
++                if hwnd or title:
++                    return int(hwnd or 0), (title or "")
++                mw = mw.parent()
++        except Exception:
++            pass
++
++        # 2) client.json 的第一个标题
++        try:
++            import json
++            cj = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'client.json')
++            if os.path.exists(cj):
++                with open(cj, 'r', encoding='utf-8') as f:
++                    data = json.load(f)
++                titles = data.get('title', {})
++                if isinstance(titles, dict) and titles:
++                    first = titles.get('0') or next(iter(titles.values()))
++                    return 0, str(first)
++        except Exception:
++            pass
++
++        return 0, ""
++
+     def delete_image(self):
+         """
+@@ -1403,4 +1669,80 @@
+         self.load_images(mode_path)
+ 
++    def capture_replace_image(self):
++        """截图替换：选中一张图，直接框选游戏画面覆盖它。
++
++        与「替换图片」的区别：不用先截好图存成文件再去资源管理器挑，
++        框选完直接覆盖。文件名、config.json 配置全部保持不变。
++        抓的是游戏窗口客户区，尺寸与识别时一致，能避免模板尺寸不匹配。
++        """
++        current_item = self.img_list.currentItem()
++        if not current_item:
++            QMessageBox.warning(self, "警告", "请选择一个图像")
++            return
++
++        mode_path = self._get_current_mode_path()
++        if not mode_path:
++            QMessageBox.warning(self, "警告", "请先选择一个模式")
++            return
++        dir_name = self._resolve_dir_name(mode_path)
++        if not dir_name:
++            QMessageBox.warning(self, "警告", "模式对应的目录名未设置")
++            return
++
++        img_name = current_item.text()
++        mode_dir = os.path.join(self.source_dir, dir_name)
++        dest_path = os.path.join(mode_dir, img_name)
++        if not os.path.exists(dest_path):
++            QMessageBox.warning(self, "警告", f"原图片文件不存在，无法替换：{img_name}")
++            return
++
++        from OAT.tools.region_capture import capture_region_from_window, save_crop
++
++        # 与「截图添加」同一套：工具自己弹遮罩，构造返回时结果已就绪，不能 exec()
++        hwnd, title = self._current_game_window()
++        crop, crop_rect, capture_size = capture_region_from_window(
++            self, hwnd=hwnd, window_title=title)
++        if crop is None:
++            return
++
++        w, h = crop.shape[1], crop.shape[0]
++        cap = capture_size or (0, 0)
++
++        if QMessageBox.question(
++            self, "确认替换",
++            f"确定用刚框选的 {w}x{h} 画面替换\n{img_name}\n吗？\n"
++            f"原图将被覆盖，文件名和配置保持不变。",
++            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
++            QMessageBox.StandardButton.No,
++        ) != QMessageBox.StandardButton.Yes:
++            return
++
++        # 先备份原图，写失败时能回滚（避免"替换失败但原图已没了"）
++        backup_path = dest_path + ".bak"
++        try:
++            shutil.copy(dest_path, backup_path)
++        except Exception as e:
++            logger.warning(f"截图替换：备份原图失败（继续尝试替换）: {e}")
++            backup_path = None
++
++        if not save_crop(crop, dest_path):
++            QMessageBox.warning(self, "警告", f"替换失败：无法写入 {img_name}")
++            return
++
++        logger.info(f"截图替换：{img_name}  {w}x{h}  来自窗口画面 {cap[0]}x{cap[1]}")
++
++        # 尺寸提醒：模板尺寸应小于等于识别时的窗口画面
++        if cap[0] and (w > cap[0] or h > cap[1]):
++            QMessageBox.warning(self, "警告", "截图尺寸比窗口画面还大，可能不对，请重新截图")
++
++        if backup_path and os.path.exists(backup_path):
++            try:
++                os.remove(backup_path)
++            except Exception:
++                pass
++
++        QMessageBox.information(self, "成功", f"图片已替换：{img_name}")
++        self.load_images(mode_path)
++
+     def edit_image_config(self):
+         """
+@@ -1461,7 +1803,7 @@
+                     if pipeline_task is not None:
+                         config_data = _pipeline_task_to_image_paths(pipeline_task)
+-                        # pipeline 无等价字段的 legacy 覆盖：仅 message / ocr_action
++                        # pipeline 无等价字段的 legacy 覆盖：仅 message / ocr_action / ocr_region
+                         legacy_entry = config.get("image_paths", {}).get(image_key, {})
+-                        for k in ("message", "ocr_action"):
++                        for k in ("message", "ocr_action", "ocr_region"):
+                             if k in legacy_entry and legacy_entry[k]:
+                                 config_data[k] = legacy_entry[k]
+
+--- a/OAT/utils/OCRService.py
++++ b/OAT/utils/OCRService.py
+@@ -1,6 +1,9 @@
+ # OCR服务类：提供统一的OCR调用接口
++import hashlib
+ import threading
+ import time
+ from typing import Optional, Tuple, List
++
++import numpy as np
+ 
+ # 导入OCR管理器
+@@ -32,6 +35,9 @@
+             self._cache = {}
+             self._cache_timeout = 1.0  # 缓存超时时间（秒）
++            # 最近一次 find_text 的匹配置信度，供上层写日志用
++            self.last_match_confidence = 0.0
+     
+-    def find_text(self, image_input, target_text: str, debug: bool = False) -> Tuple[bool, Optional[List[List[float]]], Optional[str]]:
++    def find_text(self, image_input, target_text: str, debug: bool = False,
++                  confidence_threshold: float = 0.5, region=None) -> Tuple[bool, Optional[List[List[float]]], Optional[str]]:
+         """
+         同步查找文字
+@@ -41,4 +47,6 @@
+             target_text: 要查找的目标文字
+             debug: 是否启用调试输出，默认为False
++            confidence_threshold: 置信度阈值，默认为0.5
++            region: 可选搜索区域，语义同 click_area：[x1, x2, y1, y2]（基于传入图像本身）
+             
+         返回:
+@@ -49,25 +57,40 @@
+         """
+         # 生成缓存键
++        # 注意：图像对象必须把「内容」也算进键。原来固定用 f"image:{target_text}"，
++        # 1 秒内即使换了一帧也命中旧结果，会返回上一帧的坐标 —— 表现为点错位置。
+         cache_key = None
+         if isinstance(image_input, str):
+-            cache_key = f"file:{image_input}:{target_text}"
++            cache_key = f"file:{image_input}:{target_text}:{confidence_threshold}:{region}"
+         else:
+-            # 对于图像对象，使用目标文字作为缓存键（简单方案）
+-            cache_key = f"image:{target_text}"
++            try:
++                # 降采样指纹：逐像素哈希太慢，64x64 采样足以区分不同帧
++                step_y = max(1, image_input.shape[0] // 64)
++                step_x = max(1, image_input.shape[1] // 64)
++                sig = hashlib.md5(
++                    np.ascontiguousarray(image_input[::step_y, ::step_x]).tobytes()
++                ).hexdigest()
++                cache_key = f"image:{target_text}:{sig}:{confidence_threshold}:{region}"
++            except Exception:
++                cache_key = None   # 拿不到指纹就不缓存：宁可慢，不能用错缓存
+         
+         # 检查缓存
+         current_time = time.time()
+         if cache_key and cache_key in self._cache:
+-            cached_result, cache_time = self._cache[cache_key]
++            cached = self._cache[cache_key]
++            cached_result, cache_time = cached[0], cached[1]
+             if current_time - cache_time < self._cache_timeout:
++                self.last_match_confidence = cached[2] if len(cached) > 2 else 0.0
+                 return cached_result
+         
+         # 执行OCR识别
+         try:
+-            result = self.ocr_manager.find_text_offline(image_input, target_text, debug=debug)
++            result = self.ocr_manager.find_text_offline(
++                image_input, target_text, debug=debug,
++                confidence_threshold=confidence_threshold, region=region)
++            self.last_match_confidence = self.ocr_manager.last_match_confidence
+             
+-            # 更新缓存
++            # 更新缓存（一并缓存置信度，这样缓存命中时 last_match_confidence 才准确）
+             if cache_key:
+-                self._cache[cache_key] = (result, current_time)
++                self._cache[cache_key] = (result, current_time, self.last_match_confidence)
+             
+             return result
+
+--- a/main.py
++++ b/main.py
+@@ -1,2 +1,3 @@
++# -*- coding: utf-8 -*-
+ """
+ @Author: RMA-MUN
+@@ -5,9 +6,66 @@
+ @Version: 2.3.0
+ @Location: https://github.com/RMA-MUN/OnmyojiAuto
++
++热更新启动器（hot-update launcher）
++=================================
++
++让打包后的 OAT.exe **优先从 exe 同目录下的 `OAT/` 源码文件夹加载程序代码**。
++因此修改 `OAT/**.py` 之后，只要重启程序就会生效，无需再用 Nuitka 重新编译。
++
++打包方式（关键参数，缺一不可）
++------------------------------
++    python -m nuitka --standalone \
++        --nofollow-import-to=OAT \
++        --enable-plugin=pyqt6 \
++        --include-data-dir=OAT/tools/uiResources=OAT/tools/uiResources \
++        --output-filename=OAT main.py
++
++其中 `--nofollow-import-to=OAT` 是让「磁盘源码优先」真正生效的关键：
++Nuitka 的冻结导入器（meta_path）优先级高于 sys.path，只要 OAT 被编译进 exe，
++磁盘上的 .py 就会被完全忽略 —— 这正是旧版「改了源码不生效」的根因。
++
++部署目录结构
++------------
++    OAT.exe                    <- 启动器（第三方依赖已编入）
++    *.dll / *.pyd / PyQt6/ ... <- 第三方依赖
++    OAT/                       <- 业务源码（热更新目标，改这里）
++        app/ core/ pipeline/ source/ tools/ utils/ config/
++    logs/                      <- 运行日志
++
++若 `OAT/` 文件夹不存在，会自然回退到 exe 内置代码，行为与旧版一致，不会崩。
+ """
+ 
++import os
+ import sys
++
++
++def _prefer_disk_source() -> str:
++    """把 exe（或当前脚本）所在目录插到 sys.path 最前，使 OAT 从磁盘源码加载"""
++    if getattr(sys, "frozen", False) or "__compiled__" in globals():
++        # Nuitka / PyInstaller 打包后：以 exe 所在目录为准
++        base = os.path.dirname(os.path.abspath(sys.executable))
++    else:
++        # 直接 python main.py：以本文件所在目录为准
++        base = os.path.dirname(os.path.abspath(__file__))
++
++    if os.path.isdir(os.path.join(base, "OAT")):
++        # 插到最前，确保磁盘源码优先于任何内置副本
++        while base in sys.path:
++            sys.path.remove(base)
++        sys.path.insert(0, base)
++    return base
++
++
++SOURCE_DIR = _prefer_disk_source()
++
++# 仅为让 Nuitka 收集第三方依赖而 import（该模块体内所有 import 都在函数里，
++# 运行时不执行任何 import，因此不会干扰 Qt/COM 的初始化顺序）
++try:
++    import _nuitka_deps  # noqa: F401
++except Exception:
++    pass
++
+ from OAT.core.app_launcher import launch_app
+ 
+ if __name__ == "__main__":
+-    sys.exit(launch_app())+    sys.exit(launch_app())

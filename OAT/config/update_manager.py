@@ -1,0 +1,341 @@
+from OAT.config.check_update import UpdateChecker
+from OAT.tools.ConfigManager import ConfigReader
+import os
+import json
+import requests
+import time
+import subprocess
+import sys
+import shutil
+import traceback
+
+from OAT.utils.logging import logger
+from OAT.utils.warning_box import warning_box
+from OAT.utils.error_handler import log_error
+
+
+class UpdateManager:
+    """更新管理器，负责对更新相关操作(忽略更新，立即更新)"""
+
+    def __init__(self):
+        self.checker: UpdateChecker = UpdateChecker() # 更新检查器
+        # 明确指定配置文件的绝对路径
+        config_dir = os.path.dirname(os.path.abspath(__file__))
+        update_json_path = os.path.join(config_dir, "update.json")
+
+        # 调试信息：打印配置文件路径
+        # print(f"尝试读取配置文件: {update_json_path}")
+
+        # 确保文件存在
+        if not os.path.exists(update_json_path):
+            logger.warning(f"警告：配置文件不存在: {update_json_path}")
+            # 创建默认配置
+            default_config = {
+                "ignore_versions": []
+            }
+            # 保存默认配置
+            with open(update_json_path, 'w', encoding='utf-8') as f:
+                json.dump(default_config, f, ensure_ascii=False, indent=2)
+            logger.info(f"已创建默认配置文件: {update_json_path}")
+
+        self.config_reader = ConfigReader(update_json_path)
+        self.config_data = self.config_reader.read_config()
+
+        # 确保配置数据有效
+        if self.config_data is None:
+            logger.warning("警告：配置文件读取失败，使用默认配置")
+            self.config_data = {
+                "ignore_versions": []
+            }
+
+        # 确保ignore_versions字段存在
+        if "ignore_versions" not in self.config_data:
+            self.config_data["ignore_versions"] = []
+
+    @staticmethod
+    def get_download_url(release_info: dict) -> str | None:
+        """
+        从release信息中获取zip压缩包的下载链接
+        :param release_info: GitHub Release信息
+        :return: 下载链接字符串，失败返回None
+        """
+        try:
+            assets = release_info.get("assets", [])
+            for asset in assets:
+                download_url = asset.get("browser_download_url", "")
+                if download_url.endswith(".zip"):
+                    return download_url
+            return None
+        except Exception as e:
+            error_msg = f"获取下载链接时出错: {e}"
+            # 使用warning_box显示错误信息
+            warning_box(error_msg)
+            # 写入日志文件
+            log_error(error_msg)
+            return None
+
+    def get_update(self) -> str | None:
+        """
+        检查是否有新的版本
+        :return: 最新版本号字符串或None，如"OAT-v1.5.4"
+        """
+        # 首先检查是否真的需要更新（版本号比较）
+        if not self.checker.check_update():
+            # print("当前版本已是最新版本")
+            return None
+            
+        # 获取最新版本
+        latest_version_tag = self.checker.latest_version() # 如OAT-v1.5.4
+
+        # 确保latest_version_tag不为None
+        if not latest_version_tag:
+            logger.error("无法获取最新版本信息")
+            return None
+
+        # 确保ignore_versions是列表
+        if "ignore_versions" not in self.config_data:
+            self.config_data["ignore_versions"] = []
+
+        # 如果新版本不在忽略列表里， 则返回最新版本
+        if latest_version_tag not in self.config_data["ignore_versions"]:
+            logger.info(f"最新版本为{latest_version_tag}")
+            return latest_version_tag
+        else:
+            logger.info("当前无新的版本")
+            return None
+
+    def ignore_update(self, version: str) -> bool:
+        """
+        忽略指定版本的更新
+        :param version: 版本号字符串，如"OAT-v1.5.4"
+        :return: 是否成功忽略更新
+        """
+        try:
+            # 确保ignore_versions是列表
+            if "ignore_versions" not in self.config_data:
+                self.config_data["ignore_versions"] = []
+
+            # 只添加不重复的版本号
+            if version not in self.config_data["ignore_versions"]:
+                # 尝试将最新获取的版本写入到json
+                self.config_data["ignore_versions"].append(version)
+                self.config_reader.write_config(self.config_data)
+                logger.info(f"已忽略更新版本 {version}")
+                return True
+            else:
+                logger.info(f"版本 {version} 已经在忽略列表中")
+                return True
+        except Exception as e:
+            logger.error(f"忽略更新版本 {version} 时出现异常: {e}")
+            return False
+
+    @staticmethod
+    def download_new_version(url: str, max_retries: int = 3, progress_callback=None):
+        """
+        下载最新版本，支持重试机制
+        :param url: 最新版本的下载链接
+        :param max_retries: 最大重试次数
+        :param progress_callback: 进度回调函数，参数为 (已下载, 总大小, 速度, 剩余时间)
+        :return: 下载成功返回文件路径，失败返回False
+        """
+        # 创建临时目录用于存储下载的文件
+        temp_dir = os.path.join(os.getcwd(), "temp")
+        if not os.path.exists(temp_dir):
+            os.makedirs(temp_dir)
+        
+        # 从URL中提取文件名
+        file_name = url.split("/")[-1]
+        save_path = os.path.join(temp_dir, file_name)
+        
+        # 检查本地是否已存在该文件，并校验大小
+        if os.path.exists(save_path):
+            # 先获取远程文件大小
+            try:
+                head_response = requests.head(url, timeout=30, allow_redirects=True)
+                head_response.raise_for_status()
+                remote_size = int(head_response.headers.get("content-length", 0))
+                local_size = os.path.getsize(save_path)
+                
+                if remote_size > 0 and local_size == remote_size:
+                    logger.info(f"本地文件已存在且大小匹配，直接使用: {save_path}")
+                    if progress_callback:
+                        progress_callback(local_size, remote_size, 0, 0)
+                    return save_path
+                else:
+                    logger.info(f"本地文件大小不匹配，删除重新下载: local={local_size}, remote={remote_size}")
+                    os.remove(save_path)
+            except Exception as e:
+                logger.error(f"检查本地文件时出错，将重新下载: {e}")
+                if os.path.exists(save_path):
+                    os.remove(save_path)
+        
+        # 检查项目根目录和根目录下文件夹里是否存在最新的压缩包
+        if not os.path.exists(save_path):
+            for root, dirs, files in os.walk(os.getcwd()):
+                if file_name in files:
+                    found_path = os.path.join(root, file_name)
+                    try:
+                        # 获取远程文件大小
+                        head_response = requests.head(url, timeout=30, allow_redirects=True)
+                        head_response.raise_for_status()
+                        remote_size = int(head_response.headers.get("content-length", 0))
+                        local_size = os.path.getsize(found_path)
+                        
+                        if remote_size > 0 and local_size == remote_size:
+                            logger.info(f"在项目目录中找到匹配的文件，直接使用: {found_path}")
+                            # 复制到temp目录
+                            shutil.copy2(found_path, save_path)
+                            if progress_callback:
+                                progress_callback(local_size, remote_size, 0, 0)
+                            return save_path
+                    except Exception as e:
+                        logger.error(f"检查找到的文件时出错: {e}")
+                    break
+        
+        retry_count = 0
+        while retry_count <= max_retries:
+            try:
+                logger.info(f"开始下载最新版本，保存路径: {save_path} (尝试 {retry_count + 1}/{max_retries + 1})")
+                
+                # 发送HTTP请求，获取文件大小
+                response = requests.get(url, stream=True, timeout=30)
+                response.raise_for_status()
+                
+                # 获取文件大小
+                total_size = int(response.headers.get("content-length", 0))
+                
+                # 下载文件
+                downloaded = 0
+                start_time = time.time()
+                last_update_time = start_time
+                
+                with open(save_path, "wb") as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            
+                            # 计算进度
+                            current_time = time.time()
+                            elapsed = current_time - start_time
+                            time_since_last_update = current_time - last_update_time
+                            
+                            # 每100ms更新一次进度，避免频繁回调
+                            if time_since_last_update >= 0.1 or downloaded == total_size:
+                                speed = downloaded / elapsed if elapsed > 0 else 0
+                                remaining = (total_size - downloaded) / speed if speed > 0 else 0
+                                
+                                if progress_callback:
+                                    progress_callback(downloaded, total_size, speed, remaining)
+                                
+                                last_update_time = current_time
+                
+                logger.info(f"下载完成: {save_path}")
+                return save_path
+            except requests.exceptions.HTTPError as e:
+                # 特殊处理5xx服务器错误
+                if e.response.status_code >= 500 and e.response.status_code < 600:
+                    retry_count += 1
+                    if retry_count <= max_retries:
+                        wait_time = 2 ** retry_count  # 指数退避
+                        logger.warning(f"服务器错误 ({e.response.status_code})，将在 {wait_time} 秒后重试...")
+                        time.sleep(wait_time)
+                        continue
+                logger.error(f"下载最新版本时出现HTTP错误: {e}")
+                if os.path.exists(save_path):
+                    os.remove(save_path)
+                return False
+            except requests.exceptions.RequestException as e:
+                # 网络请求错误，尝试重试
+                retry_count += 1
+                if retry_count <= max_retries:
+                    wait_time = 2 ** retry_count  # 指数退避
+                    logger.warning(f"网络请求失败: {e}，将在 {wait_time} 秒后重试...")
+                    time.sleep(wait_time)
+                    continue
+                logger.error(f"下载最新版本时出现网络错误: {e}")
+                if os.path.exists(save_path):
+                    os.remove(save_path)
+                return False
+            except Exception as e:
+                logger.error(f"下载最新版本时出现异常: {e}")
+                if os.path.exists(save_path):
+                    os.remove(save_path)
+                return False
+        return False
+
+    @staticmethod
+    def launch_updater(zip_path: str, update_log: str = "", latest_info: dict = None):
+        """
+        启动外部更新程序进行安装
+        :param zip_path: 下载的压缩包路径
+        :param update_log: 更新日志
+        :param latest_info: 最新版本信息
+        :return: 是否成功启动更新程序
+        """
+        try:
+            # 查找更新程序
+            updater_exe_names = [
+                "OAT_Updater.exe", 
+                "OAT_Updater/OAT_Updater.exe",
+                "OAT_Updater_GUI.exe",
+                "OAT_Updater/OAT_Updater_GUI.exe"
+            ]
+            updater_path = None
+            
+            for exe_name in updater_exe_names:
+                full_path = os.path.join(os.getcwd(), exe_name)
+                if os.path.exists(full_path):
+                    updater_path = full_path
+                    break
+            
+            # 如果没找到exe，尝试查找Python脚本直接运行
+            if not updater_path:
+                python_scripts = [
+                    "OAT_Updater_GUI/main.py"
+                ]
+                for script_name in python_scripts:
+                    full_path = os.path.join(os.getcwd(), script_name)
+                    if os.path.exists(full_path):
+                        updater_path = full_path
+                        break
+            
+            if not updater_path:
+                logger.error(f"未找到更新程序，尝试查找: {updater_exe_names + python_scripts}")
+                return False
+            
+            # 构建启动参数
+            if updater_path.endswith('.py'):
+                # Python脚本，用python解释器运行
+                args = [sys.executable, updater_path, f'/ZIP={zip_path}', f'/LOG={update_log}']
+            else:
+                # 可执行文件
+                args = [updater_path, f'/ZIP={zip_path}', f'/LOG={update_log}']
+            
+            # 添加版本信息参数
+            if latest_info:
+                latest_version = latest_info.get('tag_name', '')
+                published_at = latest_info.get('published_at', '')
+                if latest_version:
+                    args.append(f'/VERSION={latest_version}')
+                if published_at:
+                    args.append(f'/DATE={published_at}')
+            
+            logger.info(f"启动更新程序: {updater_path}")
+            logger.info(f"参数: {args}")
+            
+            # 启动更新程序，不等待它完成
+            if sys.platform == 'win32':
+                # Windows系统，使用DETACHED_PROCESS标志
+                DETACHED_PROCESS = 0x00000008
+                subprocess.Popen(args, creationflags=DETACHED_PROCESS, close_fds=True)
+            else:
+                # 其他系统
+                subprocess.Popen(args)
+            
+            return True
+        except Exception as e:
+            logger.error(f"启动更新程序时出错: {e}")
+            traceback.print_exc()
+            return False
+

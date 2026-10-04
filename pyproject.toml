@@ -1,0 +1,34 @@
+[project]
+name = "onmyojiproject"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "loguru>=0.7.3",
+    "nuitka>=4.0.7",
+    "numpy<2",
+    "onnxruntime==1.18.0",
+    "opencv-python==4.8.0.74",
+    "pillow==9.5.0",
+    "psutil==7.0.0",
+    "pyautogui==0.9.54",
+    "pyinstaller>=6.19.0",
+    "pynput==1.8.1",
+    "pyqt6==6.8.1",
+    "pyqt6-fluent-widgets[full]>=1.11.2",
+    "pyscreeze==0.1.28",
+    "pywin32==310",
+    "pyyaml==6.0.1",
+    "rapidocr==3.7.0",
+    "requests==2.32.5",
+    "tqdm==4.67.3",
+    "urllib3>=2.0,<3",
+]
+
+[[tool.uv.index]]
+url = "https://mirrors.aliyun.com/pypi/simple"
+default = true
+
+[tool.uv.sources]
+pyqt6-fluent-widgets = { git = "https://github.com/zhiyiYo/PyQt-Fluent-Widgets.git", rev = "PyQt6" }

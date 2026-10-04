@@ -1,0 +1,94 @@
+# 虚拟环境
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# 编译文件
+__pycache__/
+*.py[cod]
+*$py.class
+main.build
+main.dist
+*.build/
+*.dist/
+OAT_Updater_Build/
+
+# PyInstaller生成文件
+build/
+dist/
+*.spec
+
+# 日志文件
+logs/
+*.log
+log.txt
+
+# 操作系统文件
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# IDE文件
+.idea/
+.vscode/
+*.swp
+*.swo
+.trae/
+*~
+
+# 测试文件
+.pytest_cache/
+.tox/
+.coverage
+htmlcov/
+test/ocr.py
+
+# 临时文件
+*.tmp
+*.temp
+*.bak
+*.old
+update/
+temp/
+
+# 排除venv虚拟环境文件夹
+.venv
+
+# 排除nuitka-crash-report.xml文件
+nuitka-crash-report.xml
+
+# 排除platforms文件夹
+platforms/
+
+# 排除package.txt文件
+package.txt
+
+# 代码索引
+.codegraph/
+
+# 多开：launcher 本地配置（游戏路径由 OAT 运行时写入，不入库）
+yyx/yyx-launcher.ini
+
+# 调试产物（测试截图、诊断日志、一次性调试脚本，不入库）
+test/*.png
+test/logs/
+test/diag_entry.py
+test/find_tupoquan.py
+
+# AI 助手本地状态目录，不入库
+.superpowers/
+
+# ---- OTA2new 追加：构建产物与运行时文件 ----
+main.dist/
+main.build/
+platforms/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+logs/
+config/update_cache.json

@@ -1,0 +1,116 @@
+import os
+from functools import lru_cache
+from typing import Optional
+
+from OAT.source.mode_config import mode_config
+from .common_challenge import common_challenge
+from OAT.pipeline import create_and_run_pipeline
+from OAT.utils.logging import logger
+
+# 获取当前文件所在目录
+current_dir = os.path.dirname(__file__)
+# 构建mode.json的绝对路径
+mode_json_path = os.path.join(current_dir, 'mode.json')
+
+# 从模式配置文件里加载到MODE_MAPPING
+MODE_MAPPING = mode_config(mode_json_path)
+
+__all__ = ['mode_choice']
+
+# 带缓存的路径获取函数
+@lru_cache(maxsize=20)
+def get_script_dir(mode: str, sub_mode: Optional[str] = None) -> str:
+    """根据模式和子模式获取脚本目录（带缓存）"""
+    folder_info = MODE_MAPPING.get(mode)
+    if not folder_info:
+        raise ValueError(f"不支持的模式: {mode}")
+
+    if isinstance(folder_info, dict):
+        folder_name = folder_info.get(sub_mode) or folder_info.get('default') or ''
+        if not folder_name:
+            raise ValueError(f"模式 {mode} 下无有效子模式配置: {sub_mode}")
+    else:
+        folder_name = folder_info
+
+    script_dir = os.path.join(os.path.dirname(__file__), folder_name)
+    if not os.path.exists(script_dir):
+        raise FileNotFoundError(f"目录不存在: {script_dir}")
+
+    return script_dir
+
+def _notify_mode_error(message: str) -> None:
+    """模式无法启动时给出可见提示
+
+    此前只在日志里记一条 ERROR 就 return，界面上表现为“点了开始没有反应”，
+    用户只能去翻日志。
+    """
+    try:
+        from OAT.utils.warning_box import warning_box
+        available = '、'.join(k for k in MODE_MAPPING if MODE_MAPPING[k])
+        warning_box(
+            f"无法启动该模式：{message}\n\n"
+            f"请在 mode.json 中登记该模式，并确认对应目录存在。\n"
+            f"当前可用模式：{available}"
+        )
+    except Exception:
+        pass
+
+
+# 模式选择函数
+def mode_choice(
+        mode: str, sub_mode: str, times: int, config: dict,
+        window_title: str, hidden_window: bool=False, sync_mode: bool=False,
+        synchronizer=None, sync_mode_value: str = "exactly_sync",
+        explore_per_round: int = None, window_hwnd: int = None
+):
+    try:
+        # 调用缓存函数获取路径
+        script_dir = get_script_dir(mode, sub_mode)
+    except ValueError as e:
+        logger.error(f"模式配置错误: {e}")
+        logger.error('请检查是否正确选择了模式或配置文件！')
+        _notify_mode_error(str(e))
+        return
+    except FileNotFoundError as e:
+        logger.error(f"路径错误: {e}")
+        _notify_mode_error(f"模式目录不存在：{e}")
+        return
+
+    # 程序化脚本模式（如绘卷刷分：探索+突破 组合，无法用管道/通用挑战表达）
+    if 'script' in config:
+        script = config['script']
+        if script == 'huijuanshuafen':
+            from OAT.source.huijuanshuafen.huijuan import run_huijuanshuafen
+            explore_count = int(explore_per_round if explore_per_round else config.get('explore_per_round', 5))
+            logger.info(f"使用绘卷刷分脚本: {mode}，刷分次数={times}，每轮探索={explore_count}次")
+            run_huijuanshuafen(
+                window_title=window_title,
+                rounds=times,
+                explore_per_round=explore_count,
+                sync_mode=sync_mode,
+                synchronizer=synchronizer,
+                script_dir=script_dir,
+                config=config,
+                window_hwnd=window_hwnd,
+            )
+            return
+        logger.error(f"未知脚本模式: {script}")
+        return
+
+    # 执行通用挑战函数
+    if 'pipeline' in config:
+        logger.info(f"使用MAA管道模式: {mode} {sub_mode}")
+        create_and_run_pipeline(
+            config=config,
+            script_dir=script_dir,
+            window_title=window_title,
+            hidden_window=hidden_window,
+            sync_mode=sync_mode,
+            synchronizer=synchronizer,
+            sync_mode_value=sync_mode_value,
+            times=times,
+            window_hwnd=window_hwnd,
+        )
+    else:
+        common_challenge(times, config, script_dir, window_title, hidden_window, sync_mode, synchronizer, sync_mode_value,
+                         window_hwnd=window_hwnd)

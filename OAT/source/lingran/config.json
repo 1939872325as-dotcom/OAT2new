@@ -1,0 +1,21 @@
+{
+  "image_paths": {
+    "jieshu": {
+      "path": "jieshu.png"
+    },
+    "tiaozhan": {
+      "path": "tiaozhan.png",
+      "ocr_enabled": true,
+      "ocr_target_text": "挑战",
+      "ocr_confidence_threshold": 0.8,
+      "is_challenge_start": true
+    },
+    "xiezhu": {
+      "path": "xiezhu.png",
+      "message": "已拒绝好友协助"
+    },
+    "zuihou": {
+      "path": "zuihou.png"
+    }
+  }
+}

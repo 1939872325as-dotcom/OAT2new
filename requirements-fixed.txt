@@ -1,0 +1,34 @@
+# OTA2new 修正版依赖清单
+#
+# 上游 requirements.txt 的问题：
+#   1. numpy == 2.2.6 与 opencv-python == 4.8.0.74 冲突（后者要求 numpy < 2）
+#   2. 缺少 loguru / qfluentwidgets / rapidocr / onnxruntime，直接装完启动即报错
+#   3. pyyaml 重复声明；pillow 9.5.0 与 numpy 2.x 不兼容
+#
+# 以下是实测可用的组合（Python 3.12，Windows）。
+# 用法: pip install -r requirements-fixed.txt
+#
+# 注意：本文件保留上游 requirements.txt 原样未动，二者并存以便对照。
+
+# --- 上游原有 ---
+opencv-python == 4.8.0.74
+pillow == 9.5.0
+PyQt6 == 6.8.1
+pyautogui == 0.9.54
+PyYAML == 6.0.1
+pyscreeze == 0.1.28
+pywin32 == 310
+pynput == 1.8.1
+requests == 2.32.5
+urllib3 >= 2.0, < 3
+tqdm == 4.67.3
+psutil == 7.0.0
+
+# --- 修正：numpy 降到 1.26.x 以兼容 opencv-python 4.8.0.74 ---
+numpy == 1.26.4
+
+# --- 上游遗漏、实际必需 ---
+loguru == 0.7.3
+PyQt6-Fluent-Widgets == 1.11.3
+rapidocr == 3.7.0
+onnxruntime == 1.30.0

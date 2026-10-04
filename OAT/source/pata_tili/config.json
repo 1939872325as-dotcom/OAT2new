@@ -1,0 +1,31 @@
+{
+  "image_paths": {
+    "shouwei": {
+      "path": "shouwei.png"
+    },
+    "tiaozhan": {
+      "path": "tiaozhan.png",
+      "ocr_enabled": true,
+      "ocr_target_text": "挑战",
+      "ocr_confidence_threshold": 0.8,
+      "is_challenge_start": true
+    },
+    "xiezhu": {
+      "path": "xiezhu.png",
+      "message": "已拒绝好友协助"
+    },
+    "zuihou": {
+      "path": "zuihou.png"
+    },
+    "baocang": {
+      "path": "baocang.png",
+      "message": "御魂已爆仓，请及时清理"
+    },
+    "img": {
+      "path": "img.png"
+    },
+    "img_1": {
+      "path": "img_1.png"
+    }
+  }
+}
