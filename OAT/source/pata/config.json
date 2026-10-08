@@ -8,7 +8,7 @@
       "is_challenge_start": true,
       "ocr_enabled": true,
       "ocr_target_text": "挑战",
-      "ocr_confidence_threshold": 0.5,
+      "ocr_confidence_threshold": 0.8,
       "message": "",
       "is_global": false,
       "next_image": "",

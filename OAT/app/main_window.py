@@ -3,17 +3,16 @@ import json
 import os
 import threading
 import traceback
-import glob
 from datetime import datetime
 
 import cv2
 import win32gui
 from PyQt6 import QtWidgets, QtCore, QtGui
-from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QPixmap
+from PyQt6.QtCore import Qt, QUrl
+from PyQt6.QtGui import QPixmap, QDesktopServices
 from PyQt6.QtWidgets import (
-    QVBoxLayout, QHBoxLayout, QLabel, QProgressBar,
-    QPushButton, QTextEdit, QDialog, QMessageBox
+    QVBoxLayout, QHBoxLayout, QLabel,
+    QPushButton, QTextEdit, QDialog, QMessageBox, QLineEdit
 )
 
 from qfluentwidgets import (
@@ -23,7 +22,7 @@ from qfluentwidgets import (
 from OAT.tools.GetDC import WindowCapture
 from OAT.tools.ConfigManager import ConfigReader
 from OAT.tools.WindowSynchronizer import WindowSynchronizer
-from OAT.tools.ThreadManager import UpdateCheckThread, UpdateDownloadThread
+from OAT.tools.ThreadManager import UpdateCheckThread
 from OAT.tools.OnmyojiAuto import OnmyojiAutomation
 from OAT.tools.WindowChecker import WindowChecker
 from OAT.tools import settings
@@ -927,6 +926,29 @@ class MainWindow(FluentWindow):
     def on_update_error_silent(self, error_msg):
         self.log_redirect.log_to_file(f"检查更新时出错: {error_msg}")
 
+    @staticmethod
+    def _resolve_update_download_url(latest_info) -> str:
+        """解析更新包的下载链接。
+
+        优先取 release 资产里的 .zip；没有资产时回退到 Releases 页面，
+        保证弹窗里始终有一个可用的链接（至少能让人手动去找）。
+        """
+        try:
+            assets = (latest_info or {}).get('assets', []) or []
+            for asset in assets:
+                url = asset.get('browser_download_url', '') or ''
+                if url.lower().endswith('.zip'):
+                    return url
+        except Exception as e:
+            logger.warning(f"解析更新包下载链接失败: {e}")
+        try:
+            html_url = (latest_info or {}).get('html_url', '') or ''
+            if html_url:
+                return html_url
+        except Exception:
+            pass
+        return ''
+
     def on_update_available(self, latest_version, latest_info):
         if hasattr(self, 'checking_msg') and self.checking_msg and self.checking_msg.isVisible():
             self.checking_msg.close()
@@ -1010,10 +1032,30 @@ class MainWindow(FluentWindow):
             """)
             main_layout.addWidget(version_info)
 
+            # 下载链接（可选中复制；点「打开下载链接」会用系统浏览器打开）
+            download_url = self._resolve_update_download_url(latest_info)
+            if download_url:
+                link_label = QLabel("下载链接（点击下方按钮用浏览器打开）")
+                link_label.setStyleSheet(
+                    "font-family: 'Microsoft YaHei'; font-size: 12px; color: #666666; margin-top: 6px;")
+                main_layout.addWidget(link_label)
+
+                link_edit = QLineEdit(download_url)
+                link_edit.setReadOnly(True)
+                link_edit.setCursorPosition(0)
+                link_edit.setStyleSheet("""
+                    QLineEdit {
+                        border: 1px solid #d1d5db; border-radius: 4px;
+                        padding: 6px 8px; font-family: 'Consolas', 'Microsoft YaHei';
+                        font-size: 12px; color: #1f2937; background-color: #ffffff;
+                    }
+                """)
+                main_layout.addWidget(link_edit)
+
             button_layout = QHBoxLayout()
             btn_ignore = QPushButton("忽略本版本")
             btn_later = QPushButton("下次再说")
-            btn_update = QPushButton("立即更新")
+            btn_update = QPushButton("打开下载链接")
 
             btn_ignore.setStyleSheet("""
                 QPushButton {
@@ -1045,8 +1087,18 @@ class MainWindow(FluentWindow):
             main_layout.addLayout(button_layout)
 
             def on_btn_update_clicked():
-                update_dialog.close()
-                self.start_update_process(latest_info)
+                if not download_url:
+                    warning_box("该版本没有提供 zip 下载包，请到 Releases 页面手动下载。")
+                    return
+                try:
+                    opened = QDesktopServices.openUrl(QUrl(download_url))
+                except Exception as e:
+                    logger.error(f"打开下载链接失败: {e}")
+                    opened = False
+                if opened:
+                    logger.info(f"已在浏览器中打开下载链接: {download_url}")
+                else:
+                    warning_box(f"无法自动打开浏览器，请手动复制链接下载：\n\n{download_url}")
 
             def on_btn_later_clicked():
                 update_dialog.close()
@@ -1071,114 +1123,6 @@ class MainWindow(FluentWindow):
         except Exception as e:
             self.on_update_error(str(e))
 
-    def start_update_process(self, latest_info):
-        try:
-            update_manager = UpdateManager()
-            download_url = update_manager.get_download_url(latest_info)
-            if not download_url:
-                warning_box("无法获取更新包下载链接")
-                return
-
-            self.download_dialog = self.create_download_dialog()
-            self.update_download_thread = UpdateDownloadThread(download_url)
-            self.update_download_thread.download_progress.connect(self.on_download_progress)
-            self.update_download_thread.download_complete.connect(self.on_download_complete)
-            self.update_download_thread.download_error.connect(self.on_download_error)
-
-            self.download_dialog.show()
-            self.update_download_thread.start()
-        except Exception as e:
-            error_box(f"启动更新失败: {str(e)}")
-
-    def create_download_dialog(self):
-        dialog = QDialog(self)
-        dialog.setWindowTitle("正在下载更新")
-        dialog.setMinimumWidth(450)
-        dialog.setModal(True)
-        layout = QVBoxLayout()
-        layout.setSpacing(15)
-        layout.setContentsMargins(20, 20, 20, 20)
-
-        self.download_info_label = QLabel("正在准备下载...")
-        layout.addWidget(self.download_info_label)
-
-        self.download_progress_bar = QProgressBar()
-        self.download_progress_bar.setMinimum(0)
-        self.download_progress_bar.setMaximum(100)
-        self.download_progress_bar.setValue(0)
-        layout.addWidget(self.download_progress_bar)
-
-        self.speed_label = QLabel("下载速度: 等待中...")
-        layout.addWidget(self.speed_label)
-
-        self.cancel_download_btn = QPushButton("取消")
-        self.cancel_download_btn.clicked.connect(self.cancel_download)
-        layout.addWidget(self.cancel_download_btn, alignment=Qt.AlignmentFlag.AlignCenter)
-
-        dialog.setLayout(layout)
-        return dialog
-
-    def cancel_download(self):
-        if hasattr(self, 'update_download_thread') and self.update_download_thread:
-            self.update_download_thread.terminate()
-        if hasattr(self, 'download_dialog') and self.download_dialog:
-            self.download_dialog.close()
-
-    def on_download_progress(self, downloaded, total_size, speed, remaining):
-        if total_size > 0:
-            progress = int((downloaded / total_size) * 100)
-            self.download_progress_bar.setValue(progress)
-            downloaded_mb = downloaded / (1024 * 1024)
-            total_mb = total_size / (1024 * 1024)
-            speed_kb = speed / 1024
-            speed_mb = speed_kb / 1024
-            speed_str = f"{speed_mb:.2f} MB/s" if speed_mb > 1 else f"{speed_kb:.2f} KB/s"
-            if remaining > 60:
-                remaining_min = int(remaining // 60)
-                remaining_sec = int(remaining % 60)
-                remaining_str = f"{remaining_min}分{remaining_sec}秒"
-            else:
-                remaining_str = f"{int(remaining)}秒"
-            self.download_info_label.setText(f"已下载: {downloaded_mb:.2f} MB / {total_mb:.2f} MB")
-            self.speed_label.setText(f"下载速度: {speed_str} | 预计剩余: {remaining_str}")
-
-    def on_download_complete(self, zip_path):
-        if hasattr(self, 'download_dialog') and self.download_dialog:
-            self.download_dialog.close()
-        try:
-            update_manager = UpdateManager()
-            if not zip_path:
-                temp_dir = os.path.join(os.getcwd(), "temp")
-                if os.path.exists(temp_dir):
-                    zip_files = glob.glob(os.path.join(temp_dir, "*.zip"))
-                    if zip_files:
-                        zip_files.sort(key=os.path.getmtime, reverse=True)
-                        zip_path = zip_files[0]
-            if not zip_path:
-                for root, dirs, files in os.walk(os.getcwd()):
-                    for file in files:
-                        if file.endswith(".zip"):
-                            file_path = os.path.join(root, file)
-                            if not zip_path or os.path.getmtime(file_path) > os.path.getmtime(zip_path):
-                                zip_path = file_path
-            if not zip_path:
-                error_box("未找到更新压缩包")
-                return
-            update_checker = UpdateChecker()
-            latest_info = update_checker.get_latest_release_info()
-            update_log = update_checker.get_update_info(latest_info) or ""
-            if update_manager.launch_updater(zip_path, update_log, latest_info):
-                self.emergency_stop()
-            else:
-                error_box("无法启动更新程序，请确保OAT_Updater.exe存在于程序目录下")
-        except Exception as e:
-            error_box(f"启动更新程序失败: {str(e)}")
-
-    def on_download_error(self, error_msg):
-        if hasattr(self, 'download_dialog') and self.download_dialog:
-            self.download_dialog.close()
-        error_box(f"下载更新包时出错: {error_msg}")
-
     def on_update_not_available(self):
         if hasattr(self, 'checking_msg') and self.checking_msg and self.checking_msg.isVisible():
             self.checking_msg.close()
@@ -1186,7 +1130,7 @@ class MainWindow(FluentWindow):
             self.checking_msg = None
         msg_box = QMessageBox(self)
         msg_box.setWindowTitle("当前无新的版本")
-        msg_box.setText("当前版本已是最新版本")
+        msg_box.setText(f"当前版本 {APP_VERSION} 已是最新版本。")
         msg_box.setIcon(QMessageBox.Icon.Information)
         msg_box.exec()
 

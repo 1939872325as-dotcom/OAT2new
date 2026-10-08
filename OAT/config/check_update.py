@@ -107,6 +107,13 @@ class UpdateChecker:
                                f"将在 {response.headers.get('X-RateLimit-Reset', '?')} 后恢复")
                 return cached_info
 
+            if response.status_code == 404:
+                # 仓库还没有发布过任何 Release（或仓库名写错）。
+                # 这不算故障：对用户来说就是「暂无更新」，不该弹「检查更新失败」。
+                self.last_error = None
+                logger.info("检查更新：该仓库尚无 Release，视为暂无更新")
+                return None
+
             response.raise_for_status()  # 检查请求是否成功
 
             # 尝试解析JSON

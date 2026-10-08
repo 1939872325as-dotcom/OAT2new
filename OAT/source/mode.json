@@ -21,5 +21,9 @@
   "御灵": "yuling",
   "契灵探查": "qilingtancha",
   "结界突破": "jiejietupo",
-  "绘卷刷分": "huijuanshuafen"
+  "绘卷刷分": "huijuanshuafen",
+  "最新版本活动": {
+    "default": "PVE",
+    "pve": "PVE"
+  }
 }
