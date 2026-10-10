@@ -622,6 +622,56 @@ class ImageConfigDialog(QDialog):
             return
         self.pending_image_source = file_path
         self._refresh_preview(preview_path=file_path)
+        # 选了新图就顺手认一下图上的文字，帮用户把 OCR 文本框填好
+        self._autofill_ocr_from_image(file_path)
+
+    def _autofill_ocr_from_image(self, image_path: str) -> None:
+        """识别图片上的文字并填进「OCR识别文本」（只在文本框为空时填，不覆盖手填内容）。
+
+        为什么需要它：替换模板图后，OCR 兜底用的目标文字还是旧的（例如图上已
+        换成「挑战」，配置里还写着「退治」），一旦模板匹配失败就会去点错地方。
+        这里用新图自身的文字把配置对齐，避免「换了图忘了改字」。
+        """
+        if not image_path or not os.path.exists(image_path):
+            return
+        # 已经手填过就不动，尊重用户输入
+        try:
+            if self.ocr_text_edit.text().strip():
+                return
+        except AttributeError:
+            return
+
+        try:
+            from OAT.utils.OCRService import ocr_service
+        except Exception as e:
+            logger.warning(f"自动识别文字：OCR 服务不可用（{e}），请手动填写")
+            return
+
+        try:
+            items = ocr_service.recognize_all_text(image_path)
+        except Exception as e:
+            logger.warning(f"自动识别文字失败: {e}")
+            return
+
+        if not items:
+            logger.info(f"自动识别文字：{os.path.basename(image_path)} 上没认到文字，请手动填写")
+            return
+
+        # 取置信度最高的一条作为主文字；多条时把全部候选写进日志备查
+        best = max(items, key=lambda d: d.get('confidence', 0.0))
+        text = (best.get('text') or '').strip()
+        if not text:
+            return
+        self.ocr_text_edit.setText(text)
+        logger.info(f"自动识别文字：{os.path.basename(image_path)} → '{text}'"
+                    f"（置信度 {best.get('confidence', 0.0):.3f}）")
+        if len(items) > 1:
+            others = '、'.join(f"{d['text']}({d.get('confidence', 0):.2f})"
+                              for d in items if d is not best)
+            logger.info(f"  图上其余文字（未采用）：{others}")
+            self.ocr_text_edit.setToolTip(
+                f"图上识别到 {len(items)} 处文字，已自动填入置信度最高的一条：{text}\n"
+                f"其余候选：{others}\n如填错了请手动改。")
 
     def _preview_candidate_paths(self):
         """预览优先级：待替换新图 > 模式目录下老图"""
@@ -1456,6 +1506,12 @@ class ModeEditorDialog(QDialog):
         w, h = crop.shape[1], crop.shape[0]
         cap = capture_size or (0, 0)
 
+        # 顺手认一下框选出来的文字，填进对话框的「OCR识别文本」
+        ocr_text, ocr_candidates = self._detect_text_on_crop(crop)
+        if ocr_text:
+            initial_cfg["ocr_target_text"] = ocr_text
+            initial_cfg["ocr_enabled"] = True
+
         # 框选位置 (x, y, w, h) 就是客户区坐标，和识别/点击用的是同一套坐标系，
         # 所以可以直接换算成配置里的区域格式 [x1, x2, y1, y2] 预填进去，
         # 省得用户再去猜坐标。这是「截图时记录位置」的核心。
@@ -1474,6 +1530,11 @@ class ModeEditorDialog(QDialog):
                         f"来自窗口画面 {cap[0]}x{cap[1]}  区域[x1,x2,y1,y2]={box}")
         else:
             logger.info(f"截图添加：{filename}  {w}x{h}  来自窗口画面 {cap[0]}x{cap[1]}")
+
+        if ocr_text:
+            logger.info(f"截图添加：自动识别到文字 '{ocr_text}'，已预填到 OCR 识别文本")
+        elif ocr_candidates is not None:
+            logger.info(f"截图添加：框选区域没认到文字（共 {len(ocr_candidates)} 条候选）")
 
         # 尺寸提醒：模板必须和识别时的窗口尺寸一致
         if cap[0] and (w > cap[0] or h > cap[1]):
@@ -1501,6 +1562,113 @@ class ModeEditorDialog(QDialog):
                 except Exception as e:
                     QMessageBox.warning(self, "警告", f"重命名文件失败: {e}")
             self.load_images(mode_path)
+
+    @staticmethod
+    def _detect_text_on_crop(crop):
+        """对刚框选出来的图做 OCR，返回 (主文字, 全部候选)。
+
+        用途：截图添加 / 截图替换时自动把图上的文字填进 OCR 配置，
+        避免「图换了、OCR 目标文字还是旧的」导致点错位置。
+        永不抛异常；OCR 不可用时返回 ("", None) 让调用方静默跳过。
+        """
+        try:
+            from OAT.utils.OCRService import ocr_service
+        except Exception as e:
+            logger.warning(f"自动识别文字：OCR 服务不可用（{e}），请手动填写")
+            return "", None
+
+        try:
+            items = ocr_service.recognize_all_text(crop)
+        except Exception as e:
+            logger.warning(f"自动识别文字失败: {e}")
+            return "", None
+
+        if not items:
+            return "", []
+
+        # 主文字取置信度最高的一条；多条候选留给调用方打日志/提示
+        best = max(items, key=lambda d: d.get('confidence', 0.0))
+        text = (best.get('text') or '').strip()
+        if len(items) > 1:
+            others = '、'.join(f"{d['text']}({d.get('confidence', 0):.2f})"
+                              for d in items if d is not best)
+            logger.info(f"  图上其余文字（未采用）：{others}")
+        return text, items
+
+    @classmethod
+    def _detect_text_on_crop_path(cls, image_path: str):
+        """同 _detect_text_on_crop，但入参是图片文件路径（供「替换图片」用）。"""
+        try:
+            import cv2
+            img = cv2.imread(image_path)
+        except Exception as e:
+            logger.warning(f"自动识别文字：无法读取图片 {image_path}（{e}）")
+            return "", None
+        if img is None:
+            logger.warning(f"自动识别文字：无法读取图片 {image_path}")
+            return "", None
+        return cls._detect_text_on_crop(img)
+
+    @staticmethod
+    def _read_ocr_text_of(mode_dir: str, key: str) -> str:
+        """读取某张图当前的 OCR 目标文字（pipeline 为准，回退 image_paths）。"""
+        try:
+            cfg_path = os.path.join(mode_dir, 'config.json')
+            if not os.path.exists(cfg_path):
+                return ""
+            with open(cfg_path, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+            for task in (config.get('pipeline', {}) or {}).get('tasks', []) or []:
+                if task.get('name') == key:
+                    return (task.get('ocr_text') or '').strip()
+            entry = (config.get('image_paths', {}) or {}).get(key, {})
+            if isinstance(entry, dict):
+                return (entry.get('ocr_target_text') or '').strip()
+        except Exception as e:
+            logger.warning(f"读取 OCR 文字失败（{key}）: {e}")
+        return ""
+
+    @staticmethod
+    def _write_ocr_text_of(mode_dir: str, key: str, new_text: str) -> bool:
+        """把某张图的 OCR 目标文字写进 config.json（image_paths 与 pipeline 同步）。
+
+        运行时的真相是 pipeline.tasks（见 runner），但旧编辑器读的是
+        image_paths，两处必须一起改，否则界面显示和实际行为会不一致。
+        写失败返回 False，调用方提示用户手动改。
+        """
+        try:
+            cfg_path = os.path.join(mode_dir, 'config.json')
+            if not os.path.exists(cfg_path):
+                return False
+            with open(cfg_path, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+
+            changed = False
+            entry = (config.get('image_paths', {}) or {}).get(key)
+            if isinstance(entry, dict):
+                entry['ocr_target_text'] = new_text
+                # 图上有字，OCR 兜底才有意义；顺带打开开关
+                entry['ocr_enabled'] = True
+                changed = True
+
+            for task in (config.get('pipeline', {}) or {}).get('tasks', []) or []:
+                if task.get('name') == key:
+                    task['ocr_text'] = new_text
+                    # 模板+OCR：模板命中优先，失败时用 OCR 兜底
+                    if task.get('recognition') != 'ocr':
+                        task['recognition'] = 'template+ocr'
+                    changed = True
+                    break
+
+            if not changed:
+                return False
+
+            with open(cfg_path, 'w', encoding='utf-8') as f:
+                json.dump(config, f, ensure_ascii=False, indent=2)
+            return True
+        except Exception as e:
+            logger.warning(f"写入 OCR 文字失败（{key}）: {e}")
+            return False
 
     def _current_game_window(self):
         """尽力取到当前游戏窗口的 (hwnd, title)。
@@ -1650,9 +1818,28 @@ class ModeEditorDialog(QDialog):
             QMessageBox.information(self, "提示", "选择的就是当前图片，无需替换")
             return
 
+        # 先认新图上的文字：替换后若 OCR 目标文字还是旧词，模板一失败就会点错
+        key = os.path.splitext(img_name)[0]
+        ocr_text, ocr_candidates = self._detect_text_on_crop_path(src_path)
+        old_ocr_text = self._read_ocr_text_of(mode_dir, key)
+        apply_ocr_change = False
+        if ocr_text:
+            if old_ocr_text and old_ocr_text != ocr_text:
+                reply = QMessageBox.question(
+                    self, "同步 OCR 文字",
+                    f"新图上的文字是「{ocr_text}」，\n"
+                    f"而当前配置里的 OCR 识别文本是「{old_ocr_text}」。\n\n"
+                    f"要把 OCR 识别文本改成「{ocr_text}」吗？",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes,
+                )
+                apply_ocr_change = (reply == QMessageBox.StandardButton.Yes)
+            elif not old_ocr_text:
+                apply_ocr_change = True
+
         if QMessageBox.question(
             self, "确认替换",
-            f"确定要用\n{os.path.basename(src_path)}\n替换\n{img_name}\n吗？原图将被覆盖，配置保持不变。",
+            f"确定要用\n{os.path.basename(src_path)}\n替换\n{img_name}\n吗？原图将被覆盖，文件名不变。",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         ) != QMessageBox.StandardButton.Yes:
@@ -1665,7 +1852,17 @@ class ModeEditorDialog(QDialog):
             QMessageBox.warning(self, "警告", f"替换图片失败: {e}")
             return
 
-        QMessageBox.information(self, "成功", f"图片已替换：{img_name}")
+        ocr_note = ""
+        if apply_ocr_change and ocr_text:
+            if self._write_ocr_text_of(mode_dir, key, ocr_text):
+                ocr_note = f"\nOCR 识别文本已同步为「{ocr_text}」"
+                logger.info(f"替换图片：OCR 识别文本已更新 '{old_ocr_text}' → '{ocr_text}'")
+            else:
+                ocr_note = f"\n（OCR 识别文本同步失败，请手动改成「{ocr_text}」）"
+        elif ocr_text and old_ocr_text and old_ocr_text != ocr_text:
+            ocr_note = f"\n（保留了原 OCR 识别文本「{old_ocr_text}」）"
+
+        QMessageBox.information(self, "成功", f"图片已替换：{img_name}{ocr_note}")
         self.load_images(mode_path)
 
     def capture_replace_image(self):
@@ -1708,10 +1905,30 @@ class ModeEditorDialog(QDialog):
         w, h = crop.shape[1], crop.shape[0]
         cap = capture_size or (0, 0)
 
+        # 认一下新框选的文字：替换后配置里的 OCR 目标文字若还是旧图上的词，
+        # 模板匹配一失败就会按旧词去 OCR，可能点到别处。
+        ocr_text, ocr_candidates = self._detect_text_on_crop(crop)
+        key = os.path.splitext(img_name)[0]
+        old_ocr_text = self._read_ocr_text_of(mode_dir, key)
+        apply_ocr_change = False
+        if ocr_text:
+            if old_ocr_text and old_ocr_text != ocr_text:
+                reply = QMessageBox.question(
+                    self, "同步 OCR 文字",
+                    f"新图上的文字是「{ocr_text}」，\n"
+                    f"而当前配置里的 OCR 识别文本是「{old_ocr_text}」。\n\n"
+                    f"要把 OCR 识别文本改成「{ocr_text}」吗？",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes,
+                )
+                apply_ocr_change = (reply == QMessageBox.StandardButton.Yes)
+            elif not old_ocr_text:
+                apply_ocr_change = True
+
         if QMessageBox.question(
             self, "确认替换",
             f"确定用刚框选的 {w}x{h} 画面替换\n{img_name}\n吗？\n"
-            f"原图将被覆盖，文件名和配置保持不变。",
+            f"原图将被覆盖，文件名不变。",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         ) != QMessageBox.StandardButton.Yes:
@@ -1741,7 +1958,18 @@ class ModeEditorDialog(QDialog):
             except Exception:
                 pass
 
-        QMessageBox.information(self, "成功", f"图片已替换：{img_name}")
+        # 按用户确认的结果同步 OCR 文字（图片已落地，这一步失败不影响替换本身）
+        ocr_note = ""
+        if apply_ocr_change and ocr_text:
+            if self._write_ocr_text_of(mode_dir, key, ocr_text):
+                ocr_note = f"\nOCR 识别文本已同步为「{ocr_text}」"
+                logger.info(f"截图替换：OCR 识别文本已更新 '{old_ocr_text}' → '{ocr_text}'")
+            else:
+                ocr_note = f"\n（OCR 识别文本同步失败，请手动改成「{ocr_text}」）"
+        elif ocr_text and old_ocr_text and old_ocr_text != ocr_text:
+            ocr_note = f"\n（保留了原 OCR 识别文本「{old_ocr_text}」）"
+
+        QMessageBox.information(self, "成功", f"图片已替换：{img_name}{ocr_note}")
         self.load_images(mode_path)
 
     def edit_image_config(self):

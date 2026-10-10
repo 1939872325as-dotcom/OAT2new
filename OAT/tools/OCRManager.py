@@ -176,6 +176,86 @@ class OCRManager:
         return found, text_area, real_text
 
 
+    def recognize_all_text(self, image_input, min_confidence: float = 0.5):
+        """识别图片里的【全部】文字（不限定目标词），按阅读顺序返回。
+
+        用途：替换模板图时自动认出图上的文字，帮用户把「OCR识别文本」填好。
+        早前没有这个方法，只能给定目标词去查找，因此没法做「自动识别图片文字」。
+
+        Args:
+            image_input: 图片路径（str）或图像对象（numpy 数组）
+            min_confidence: 置信度下限，低于此值的结果丢弃
+
+        Returns:
+            list[dict]: 每项 {text, confidence, area}，按从上到下、从左到右排序；
+                        识别不到或失败时返回空列表。永不抛异常。
+        """
+        try:
+            if isinstance(image_input, str):
+                if not os.path.exists(image_input):
+                    logger.error(f"图片不存在：{image_input}")
+                    return []
+                img = cv2.imread(image_input)
+                if img is None:
+                    logger.error(f"无法读取图片：{image_input}")
+                    return []
+            else:
+                img = image_input
+
+            if img is None or getattr(img, "size", 0) == 0:
+                return []
+
+            # 与 find_text_offline 保持同样的预处理，保证识别口径一致
+            img = cv2.convertScaleAbs(img, alpha=1.5, beta=0)
+
+            self._init_reader()
+            if self.reader is None:
+                return []
+
+            results = self.reader(img)
+            if not getattr(results, 'txts', None):
+                return []
+
+            try:
+                lo = float(min_confidence)
+            except (ValueError, TypeError):
+                lo = 0.5
+
+            items = []
+            for i in range(len(results.txts)):
+                text = results.txts[i]
+                if text is None:
+                    continue
+                text = str(text).strip()
+                if not text:
+                    continue
+                try:
+                    conf = float(results.scores[i])
+                except (ValueError, TypeError, IndexError):
+                    conf = 0.0
+                if conf < lo:
+                    continue
+                try:
+                    box = results.boxes[i]
+                    area = box.tolist() if hasattr(box, 'tolist') else box
+                except (IndexError, AttributeError):
+                    area = None
+                # 排序键：文本框上边缘 → 左边缘，还原成阅读顺序
+                y0 = min(p[1] for p in area) if area else 0.0
+                x0 = min(p[0] for p in area) if area else 0.0
+                items.append({'text': text, 'confidence': conf,
+                              'area': area, '_y': y0, '_x': x0})
+
+            items.sort(key=lambda d: (round(d['_y'] / 10.0), d['_x']))
+            for d in items:
+                d.pop('_y', None)
+                d.pop('_x', None)
+            return items
+        except Exception as e:
+            logger.warning(f"识别图片文字失败: {e}")
+            return []
+
+
 # ===================== 测试（只改这里） =====================
 if __name__ == "__main__":
     # 创建OCR管理器实例

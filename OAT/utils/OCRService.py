@@ -97,6 +97,23 @@ class OCRService:
         except Exception:
             return False, None, None
     
+    def recognize_all_text(self, image_input, min_confidence: float = 0.5) -> List[dict]:
+        """识别图片里的全部文字，供「替换模板图时自动填 OCR 文本」使用。
+
+        与 find_text 的区别：不限定目标词，返回图上所有文字。
+        识别不到或失败时返回空列表（调用方据此提示用户手动填写）。
+        """
+        try:
+            return self.ocr_manager.recognize_all_text(
+                image_input, min_confidence=min_confidence)
+        except Exception as e:
+            try:
+                from OAT.utils.logging import logger
+                logger.warning(f"识别图片文字失败: {e}")
+            except Exception:
+                pass
+            return []
+
     def get_text_area_center(self, text_area: List[List[float]]) -> Tuple[float, float]:
         """
         获取文字区域的中心点坐标

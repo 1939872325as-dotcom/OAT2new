@@ -1,3 +1,4 @@
+import os
 import random
 import time
 from typing import Optional, Tuple
@@ -30,6 +31,10 @@ def _normalize_threshold(threshold) -> float:
 class OpenCVRecognitionEngine(RecognitionEngine):
     """基于 OpenCV 模板匹配 + RapidOCR 的识别引擎"""
 
+    # 模板缓存：{路径: (mtime, 图片)}。缓存带文件修改时间校验，
+    # 因为这是【类属性】—— 所有引擎实例共享，且进程存活期间一直存在。
+    # 早前只按路径缓存、从不校验 mtime，导致「在程序运行中替换模板图后，
+    # 仍然拿旧图去匹配」（表现为：换了图还是按旧模板的尺寸/内容识别失败）。
     _template_cache: dict = {}
 
     def __init__(
@@ -106,11 +111,25 @@ class OpenCVRecognitionEngine(RecognitionEngine):
             return 0
 
     def _load_template(self, template_path: str) -> Optional[np.ndarray]:
-        if template_path in self._template_cache:
-            return self._template_cache[template_path]
+        # 取文件修改时间；取不到（文件不存在等）则退化为不缓存
+        try:
+            mtime = os.path.getmtime(template_path)
+        except OSError:
+            mtime = None
+
+        if mtime is not None:
+            cached = self._template_cache.get(template_path)
+            if cached is not None and cached[0] == mtime:
+                return cached[1]
+
         target = cv2.imread(template_path)
-        if target is not None:
-            self._template_cache[template_path] = target
+        if target is not None and mtime is not None:
+            self._template_cache[template_path] = (mtime, target)
+            logger.info(f"已加载模板 {os.path.basename(template_path)}"
+                        f"（{target.shape[1]}x{target.shape[0]}）")
+        elif target is not None:
+            # 拿不到 mtime：仍然返回，但不写入缓存，避免用到过期图
+            logger.warning(f"无法读取模板修改时间，本次不缓存: {template_path}")
         return target
 
     def capture_screenshot(self) -> Optional[np.ndarray]:
