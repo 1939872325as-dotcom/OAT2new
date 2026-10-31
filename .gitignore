@@ -92,3 +92,6 @@ __pycache__/
 *.log
 logs/
 config/update_cache.json
+
+# 更新检查本地缓存（运行时生成）
+OAT/config/update_cache.json
