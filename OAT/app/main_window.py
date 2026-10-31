@@ -29,7 +29,7 @@ from OAT.tools import settings
 from OAT.config.check_update import UpdateChecker
 from OAT.config.update_manager import UpdateManager
 from OAT.source import *
-from OAT.source import MODE_MAPPING
+from OAT.source import MODE_MAPPING, reload_mode_mapping
 from OAT.tools import *
 from OAT.utils.error_handler import setup_global_exception_handler, LOG_FILE, log_error
 from OAT.utils.logging import LogRedirect, logger
@@ -1236,6 +1236,9 @@ class MainWindow(FluentWindow):
     def open_mode_editor_dialog(self):
         dialog = ModeEditorDialog(self)
         dialog.exec()
+        # 编辑器保存会改写 mode.json，而 MODE_MAPPING 是导入时构建的：
+        # 不刷新的话，刚添加的模式下拉里能选到、点「开始」却报「不支持的模式」。
+        reload_mode_mapping()
         self.ui.home_page.reload_modes()
         # 重载会清空下拉、把当前选择丢掉：按记忆恢复回来（模式已被删除则退回默认）
         self._restore_mode_selection()

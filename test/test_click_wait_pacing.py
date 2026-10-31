@@ -125,9 +125,16 @@ def test_range_resolution_is_identical_across_both_paths():
 
 
 def test_partial_config_fills_the_other_side_with_default():
-    # 文档口径：只填下限 2 → 2~5（不是整体回落到 0.3~5）
-    assert resolve_click_wait_range(2, None) == (2.0, 5.0)
-    assert resolve_click_wait_range(None, 3) == (0.3, 3.0)
+    """只填一个框时，另一个按默认补（不是整体回落到默认区间）。
+
+    期望值取 DEFAULT_CLICK_WAIT_RANGE，不写死数字 —— 默认下限是可调的
+    （曾从 0.3 调到 0.8），写死会让这条测试在正常改动后误报。
+    """
+    lo_default, hi_default = DEFAULT_CLICK_WAIT_RANGE
+    # 只填下限 → 上限按默认
+    assert resolve_click_wait_range(2, None) == (2.0, hi_default)
+    # 只填上限 → 下限按默认
+    assert resolve_click_wait_range(None, 3) == (lo_default, 3.0)
 
 
 def test_defaults_when_nothing_configured():

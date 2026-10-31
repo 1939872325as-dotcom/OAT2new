@@ -15,7 +15,23 @@ mode_json_path = os.path.join(current_dir, 'mode.json')
 # 从模式配置文件里加载到MODE_MAPPING
 MODE_MAPPING = mode_config(mode_json_path)
 
-__all__ = ['mode_choice']
+__all__ = ['mode_choice', 'reload_mode_mapping']
+
+
+def reload_mode_mapping() -> None:
+    """重新读取 mode.json，就地刷新 MODE_MAPPING。
+
+    模式编辑器保存后 mode.json 会变，但 MODE_MAPPING 是导入时构建的。
+    不刷新的话，刚添加的模式在下拉里能选到、点「开始」却被判成
+    「不支持的模式」。这里就地 clear+update，保证 main_window 等模块
+    已经持有的 MODE_MAPPING 引用一起生效。
+    """
+    new_mapping = mode_config(mode_json_path) or {}
+    if not isinstance(MODE_MAPPING, dict):
+        return
+    MODE_MAPPING.clear()
+    MODE_MAPPING.update(new_mapping)
+    get_script_dir.cache_clear()
 
 # 带缓存的路径获取函数
 @lru_cache(maxsize=20)

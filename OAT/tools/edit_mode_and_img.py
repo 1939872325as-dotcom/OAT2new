@@ -4,8 +4,8 @@ import ast
 import shutil
 import time
 from PyQt6 import QtCore, QtGui, QtWidgets
-from PyQt6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QTreeWidget, QTreeWidgetItem, QPushButton, QLineEdit, QLabel, QFileDialog, QListWidget, QListWidgetItem, QMessageBox, QSplitter
-from PyQt6.QtGui import QPixmap
+from PyQt6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QTreeWidget, QTreeWidgetItem, QPushButton, QLineEdit, QLabel, QFileDialog, QListWidget, QListWidgetItem, QMessageBox, QSplitter, QMenu
+from PyQt6.QtGui import QPixmap, QShortcut, QKeySequence
 
 from OAT.utils.logging import logger
 
@@ -26,6 +26,11 @@ def _normalize_dest_filename(new_name: str, pending_source=None, old_image_name=
     if not fallback:
         fallback = ".png"
     return s + fallback
+
+
+# mode.json 里「没选子模式时」用的兜底键。它出现在模式树里以便改配置，
+# 但删除/改名会被拦住：删掉它，该模式在没有子模式时就无法启动。
+DEFAULT_SUBMODE_KEY = 'default'
 
 
 def _normalize_confidence(raw, default=0.8) -> float:
@@ -160,12 +165,12 @@ def _image_paths_to_pipeline_task(name: str, data: dict) -> dict:
     """将 image_paths 格式的配置项转换为 pipeline.tasks 格式"""
     task = {"name": name, "template": data.get("path", name + ".png")}
 
-    # 点击后随机等待（每张图独立，留空则运行时按默认 0.3~5）
+    # 点击后随机等待（每张图独立，留空则运行时按默认 0.8~5）
     _cw_min = _normalize_wait(data.get("click_wait_min"))
     _cw_max = _normalize_wait(data.get("click_wait_max"))
     if _cw_min is not None or _cw_max is not None:
         if _cw_min is None:
-            _cw_min = 0.3
+            _cw_min = 0.8
         if _cw_max is None:
             _cw_max = 5.0
         if _cw_max < _cw_min:
@@ -191,6 +196,11 @@ def _image_paths_to_pipeline_task(name: str, data: dict) -> dict:
     # OCR 搜索区域（可选）：限定 OCR 只在该区域内找文字，用于排除同页出现的
     # 相同文字。语义与 click_area 一致 [x1, x2, y1, y2]（客户区坐标）。
     ocr_region = _normalize_area(data.get("ocr_region"))
+    # OCR 点击区域（可选）：OCR 命中后，点在【这个框内】的随机位置。
+    # 用于「文字在一处、真正要点的地方在另一处」的场景。
+    ocr_click_area = _normalize_area(data.get("ocr_click_area"))
+    _ocr_action_raw = (data.get("ocr_action") or "").strip()
+    _ocr_wants_click_area = (_ocr_action_raw == "点击框选区域内的随机位置")
     # 逆向转换会把原始 recognition 存下来（审批：接受冗余字段），优先还原纯 ocr 模式
     if data.get("recognition") == "ocr" and ocr_text:
         task["recognition"] = "ocr"
@@ -201,6 +211,8 @@ def _image_paths_to_pipeline_task(name: str, data: dict) -> dict:
             task["ocr_confidence"] = 0.8
         if ocr_region:
             task["ocr_region"] = ocr_region
+        if _ocr_wants_click_area and ocr_click_area:
+            task["ocr_click_area"] = ocr_click_area
     elif ocr_enabled and ocr_text:
         task["recognition"] = "template+ocr"
         task["ocr_text"] = ocr_text
@@ -210,8 +222,16 @@ def _image_paths_to_pipeline_task(name: str, data: dict) -> dict:
             task["ocr_confidence"] = 0.8
         if ocr_region:
             task["ocr_region"] = ocr_region
+        if _ocr_wants_click_area and ocr_click_area:
+            task["ocr_click_area"] = ocr_click_area
 
-    click_area = data.get("click_area")
+    # 落点规则（按使用习惯设计）：
+    #   勾「点击自定义区域」 → 用这块坐标，【覆盖】识别位置（截图记的位置也一并覆盖）
+    #   没勾                 → 用识别位置（模板匹配到哪点哪）
+    # 「点击框选区域内的随机位置」是 OCR 专属动作，落点由 ocr_click_area 决定。
+    click_area = _normalize_area(data.get("click_area"))
+    _click_type = (data.get("click_type") or "").strip()
+    _use_custom_area = (_click_type == "coordinate")
     action_type = (data.get("action_type") or "click")
     if action_type == "wait":
         try:
@@ -244,12 +264,15 @@ def _image_paths_to_pipeline_task(name: str, data: dict) -> dict:
             action["duration"] = 0.5
         task["action"] = action
     elif click_area and len(click_area) == 4:
-        # ocr_action 语义：文字区域（缺省/空默认为文字区域）+ 有 OCR 时 runner 无 action 即点文字区，故省略 fixed_coord
+        # 只有显式勾了「点击自定义区域」才生成 fixed_coord（覆盖识别位置）；
+        # 没勾时 click_area 只是截图记下的参考值，落点交给识别结果。
+        # 例外：「点击框选区域内的随机位置」由 ocr_click_area 决定，不在这里生成。
         _ocr_action = (data.get("ocr_action") or "").strip()
         if not _ocr_action:
             _ocr_action = "点击文字所在区域"
         _has_ocr = task.get("recognition") in ("ocr", "template+ocr")
-        if not (_has_ocr and _ocr_action == "点击文字所在区域"):
+        _ocr_click_owns = _has_ocr and _ocr_action == "点击框选区域内的随机位置"
+        if _use_custom_area and not _ocr_click_owns:
             try:
                 task["action"] = {
                     "type": "click",
@@ -321,9 +344,25 @@ def _pipeline_task_to_image_paths(task: dict) -> dict:
         data["click_wait_min"] = _cw_min
     if _cw_max is not None:
         data["click_wait_max"] = _cw_max
-    data["ocr_action"] = "点击文字所在区域"
 
+    # OCR 点击区域：往返保留（「点击框选区域内的随机位置」专用）
+    _occ = task.get("ocr_click_area")
+    if _occ and len(_occ) == 4:
+        try:
+            data["ocr_click_area"] = [int(v) for v in _occ]
+        except (ValueError, TypeError):
+            pass
+
+    # ocr_action 往返保留：早前这里硬编码成「点击文字所在区域」，
+    # 导致「点击点击区域设置的区域」和「点击框选区域内的随机位置」保存后丢失。
     action = task.get("action", {}) or {}
+    if _occ and len(_occ) == 4:
+        data["ocr_action"] = "点击框选区域内的随机位置"
+    elif action.get("target") == "fixed_coord":
+        data["ocr_action"] = "点击点击区域设置的区域"
+    else:
+        data["ocr_action"] = "点击文字所在区域"
+
     action_type = (action.get("type") or "click")
     data["action_type"] = action_type
     if action_type == "wait":
@@ -370,6 +409,89 @@ def _pipeline_task_to_image_paths(task: dict) -> dict:
     return data
 
 
+# 「图片 + 配置」复制粘贴（Ctrl+C / Ctrl+V）的进程内剪贴板。
+# 存图片字节和配置快照，而不是源文件路径：复制后源图被改名/删除，粘贴照样能落地。
+# 不走系统剪贴板，避免覆盖用户自己复制的文字；同一进程内跨模式、跨对话框都有效。
+_IMAGE_CLIPBOARD = {
+    "image_name": "",
+    "image_bytes": b"",
+    "config": {},
+    "source_mode_dir": "",
+}
+
+
+def _unique_paste_filename(mode_dir: str, image_name: str, existing_keys) -> str:
+    """为粘贴生成不重名的文件名：foo.png → foo_copy.png → foo_copy2.png …
+
+    同时避开目录里已有的文件和配置里已有的键（键是去后缀的文件名），
+    否则会出现「文件写进去但配置键撞车」或反之。
+    """
+    stem, ext = os.path.splitext(image_name or "")
+    stem = stem or "image"
+    ext = ext or ".png"
+    keys = set(existing_keys or ())
+    n = 1
+    while True:
+        suffix = "_copy" if n == 1 else f"_copy{n}"
+        candidate = f"{stem}{suffix}{ext}"
+        key = os.path.splitext(candidate)[0]
+        if key not in keys and not os.path.exists(os.path.join(mode_dir, candidate)):
+            return candidate
+        n += 1
+
+
+def _prepare_pasted_config(config, old_key: str, new_key: str, new_filename: str) -> dict:
+    """把复制来的配置改到目标模式：path 换新文件名，自引用的 next 指向新键。
+
+    其余字段（OCR 文本/阈值、点击区域、动作、等待区间…）原样保留 —— 复制粘贴
+    的语义就是「配置一起带过去」。next_image 指向别的图时保持不动：目标模式里
+    有没有那张图由用户自己决定，编辑器不擅自改写别人的引用。
+    """
+    try:
+        cfg = json.loads(json.dumps(config or {}))
+    except (TypeError, ValueError):
+        cfg = dict(config or {})
+    cfg["path"] = new_filename
+    if cfg.get("next_image") == old_key:
+        cfg["next_image"] = new_key
+    return cfg
+
+
+def _insert_pasted_image(config: dict, new_key: str, cfg: dict) -> None:
+    """把粘贴的图片配置写进目标 config（image_paths + 已有 pipeline 时同步 tasks）
+
+    配置结构异常（image_paths/pipeline 不是预期类型）时抛 ValueError，
+    由调用方在落盘前中止 —— 宁可不粘贴，也不静默覆盖用户已有的配置。
+    """
+    image_paths = config.get("image_paths")
+    if image_paths is None:
+        image_paths = {}
+        config["image_paths"] = image_paths
+    if not isinstance(image_paths, dict):
+        raise ValueError("目标配置的 image_paths 不是对象")
+    image_paths[new_key] = cfg
+
+    # 只有目标配置本身就有 pipeline 才同步：老格式模式走 common_challenge，
+    # 凭空加一个 pipeline 会改变它的运行路径。
+    if config.get("pipeline") is not None:
+        pipeline = config["pipeline"]
+        if not isinstance(pipeline, dict):
+            raise ValueError("目标配置的 pipeline 不是对象")
+        tasks = pipeline.get("tasks")
+        if tasks is None:
+            tasks = []
+            pipeline["tasks"] = tasks
+        if not isinstance(tasks, list):
+            raise ValueError("目标配置的 pipeline.tasks 不是数组")
+        task = _image_paths_to_pipeline_task(new_key, cfg)
+        for i, t in enumerate(tasks):
+            if isinstance(t, dict) and t.get("name") == new_key:
+                tasks[i] = task
+                break
+        else:
+            tasks.append(task)
+
+
 class ImageConfigDialog(QDialog):
     def __init__(self, parent=None, image_name="", config_data={}, config_path="", image_list=[]):
         super().__init__(parent)
@@ -382,6 +504,9 @@ class ImageConfigDialog(QDialog):
         self.image_list = image_list
         # 待替换的新图绝对路径（浏览选择后设置，保存时复制到模式目录）
         self.pending_image_source = None
+        # OCR点击区域是否被用户单独框选过（决定它是否跟随「自定义区域」）
+        self._ocr_click_area_user_set = False
+        self._ocr_click_area_auto_value = None
 
         # 初始化UI
         self.setup_ui()
@@ -509,16 +634,24 @@ class ImageConfigDialog(QDialog):
         custom_area_layout = QHBoxLayout()
         custom_area_label = QLabel("自定义区域:")
         self.custom_area_line_edit = QLineEdit(str(self.config_data.get("click_area", [100, 200, 200, 400])))
+        self.custom_area_pick_btn = QPushButton("框选")
+        self.custom_area_pick_btn.setToolTip("到游戏画面上框选一块区域，自动填入坐标（[x1, x2, y1, y2]）")
+        self.custom_area_pick_btn.clicked.connect(self.pick_custom_area)
         custom_area_layout.addWidget(custom_area_label)
         custom_area_layout.addWidget(self.custom_area_line_edit)
+        custom_area_layout.addWidget(self.custom_area_pick_btn)
         click_area_layout.addLayout(custom_area_layout)
 
         # 终点区域（滑动终点坐标范围，格式同自定义区域）
         end_area_layout = QHBoxLayout()
         end_area_label = QLabel("终点区域:")
         self.end_area_line_edit = QLineEdit(str(self.config_data.get("end_area", [100, 200, 200, 400])))
+        self.end_area_pick_btn = QPushButton("框选")
+        self.end_area_pick_btn.setToolTip("到游戏画面上框选一块区域，自动填入坐标（[x1, x2, y1, y2]）")
+        self.end_area_pick_btn.clicked.connect(self.pick_end_area)
         end_area_layout.addWidget(end_area_label)
         end_area_layout.addWidget(self.end_area_line_edit)
+        end_area_layout.addWidget(self.end_area_pick_btn)
         click_area_layout.addLayout(end_area_layout)
 
         # 时长（滑动时长 / 等待秒数，单位秒）
@@ -533,7 +666,7 @@ class ImageConfigDialog(QDialog):
         # 用于模拟人工节奏，避免固定间隔被判定为脚本。
         click_wait_layout = QHBoxLayout()
         click_wait_label = QLabel("点击后随机等待(秒):")
-        self.click_wait_min_edit = QLineEdit(str(self.config_data.get("click_wait_min", 0.3)))
+        self.click_wait_min_edit = QLineEdit(str(self.config_data.get("click_wait_min", 0.8)))
         self.click_wait_min_edit.setFixedWidth(60)
         self.click_wait_max_edit = QLineEdit(str(self.config_data.get("click_wait_max", 5.0)))
         self.click_wait_max_edit.setFixedWidth(60)
@@ -541,7 +674,7 @@ class ImageConfigDialog(QDialog):
         click_wait_layout.addWidget(self.click_wait_min_edit)
         click_wait_layout.addWidget(QLabel("~"))
         click_wait_layout.addWidget(self.click_wait_max_edit)
-        click_wait_layout.addWidget(QLabel("（默认 0.3~5，留空按默认）"))
+        click_wait_layout.addWidget(QLabel("（默认 0.8~5，留空按默认）"))
         click_wait_layout.addStretch()
         click_area_layout.addLayout(click_wait_layout)
 
@@ -578,8 +711,12 @@ class ImageConfigDialog(QDialog):
         _ocr_region_val = self.config_data.get("ocr_region")
         self.ocr_region_edit = QLineEdit("" if not _ocr_region_val else str(list(_ocr_region_val)))
         self.ocr_region_edit.setPlaceholderText("可选，[x1, x2, y1, y2]，留空 = 全窗口")
+        self.ocr_region_pick_btn = QPushButton("框选")
+        self.ocr_region_pick_btn.setToolTip("到游戏画面上框选一块区域作为 OCR 搜索范围")
+        self.ocr_region_pick_btn.clicked.connect(self.pick_ocr_region)
         ocr_region_layout.addWidget(ocr_region_label)
         ocr_region_layout.addWidget(self.ocr_region_edit)
+        ocr_region_layout.addWidget(self.ocr_region_pick_btn)
         ocr_layout.addLayout(ocr_region_layout)
         
         # OCR识别后的操作
@@ -588,6 +725,7 @@ class ImageConfigDialog(QDialog):
         self.ocr_action_combo = QtWidgets.QComboBox()
         self.ocr_action_combo.addItem("点击文字所在区域")
         self.ocr_action_combo.addItem("点击点击区域设置的区域")
+        self.ocr_action_combo.addItem("点击框选区域内的随机位置")
         current_action = self.config_data.get("ocr_action", "点击文字所在区域")
         index = self.ocr_action_combo.findText(current_action)
         if index != -1:
@@ -595,6 +733,27 @@ class ImageConfigDialog(QDialog):
         ocr_action_layout.addWidget(ocr_action_label)
         ocr_action_layout.addWidget(self.ocr_action_combo)
         ocr_layout.addLayout(ocr_action_layout)
+
+        # OCR 点击区域（选「点击框选区域内的随机位置」时用；与上面点击区域设置里的
+        # 自定义区域相互独立，方便「文字在一处、要点在另一处」的场景）
+        #
+        # 默认值：没单独配过就沿用「自定义区域」的坐标 —— 大多数情况下
+        # 想点的地方就是框选出来的那块，不必再框一遍；真要不同再单独框选覆盖。
+        ocr_click_layout = QHBoxLayout()
+        ocr_click_label = QLabel("OCR点击区域:")
+        _occ = self.config_data.get("ocr_click_area")
+        if not _occ:
+            _occ = self.config_data.get("click_area")
+        self.ocr_click_area_edit = QLineEdit("" if not _occ else str(list(_occ)))
+        self.ocr_click_area_edit.setPlaceholderText(
+            "可选，[x1, x2, y1, y2]；动作为「点击框选区域内的随机位置」时必填")
+        self.ocr_click_pick_btn = QPushButton("框选")
+        self.ocr_click_pick_btn.setToolTip("到游戏画面上框选 OCR 识别成功后要点击的范围")
+        self.ocr_click_pick_btn.clicked.connect(self.pick_ocr_click_area)
+        ocr_click_layout.addWidget(ocr_click_label)
+        ocr_click_layout.addWidget(self.ocr_click_area_edit)
+        ocr_click_layout.addWidget(self.ocr_click_pick_btn)
+        ocr_layout.addLayout(ocr_click_layout)
         
         main_layout.addWidget(ocr_group)
         
@@ -704,7 +863,133 @@ class ImageConfigDialog(QDialog):
             self.preview_label.setText(f"已选择：{os.path.basename(self.pending_image_source)}（无预览）")
         else:
             self.preview_label.setText("暂无预览")
-    
+
+    # ---------- 框选坐标（复用 region_capture 的遮罩） ----------
+
+    def _current_game_window(self):
+        """尽力取到当前游戏窗口的 (hwnd, title)。
+
+        ImageConfigDialog 是从 ModeEditorDialog 弹出的，往上找父链拿主界面
+        选中的句柄；拿不到再回落到 client.json 里的标题。
+        （与 ModeEditorDialog 的同名方法同源，两边各自独立。）
+        """
+        # 1) 沿父链找主界面窗口上的选中句柄
+        try:
+            w = self.parent()
+            for _ in range(6):
+                if w is None:
+                    break
+                hwnd = getattr(w, 'selected_hwnd', None)
+                title = getattr(w, 'window_title', None)
+                if hwnd or title:
+                    return int(hwnd or 0), (title or "")
+                w = w.parent()
+        except Exception:
+            pass
+
+        # 2) client.json 的第一个标题
+        try:
+            cj = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'client.json')
+            if os.path.exists(cj):
+                with open(cj, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                titles = data.get('title', {})
+                if isinstance(titles, dict) and titles:
+                    first = titles.get('0') or next(iter(titles.values()))
+                    return 0, str(first)
+        except Exception:
+            pass
+
+        return 0, ""
+
+    def _pick_area_rect(self, hint: str):
+        """到游戏画面上框选一块区域，返回 [x1, x2, y1, y2]；取消返回 None。
+
+        框选用的是「后台抓取的游戏窗口客户区」图，与识别/点击同一套坐标系，
+        所以框出来的坐标可以直接写进配置，不需要任何换算。
+        """
+        try:
+            from OAT.tools.region_capture import capture_region_from_window
+        except Exception as e:
+            QMessageBox.warning(self, "警告", f"框选工具不可用: {e}")
+            return None
+
+        hwnd, title = self._current_game_window()
+        _crop, crop_rect, _size = capture_region_from_window(
+            self, hwnd=hwnd, window_title=title)
+        if crop_rect is None:
+            return None
+        rx, ry, rw, rh = crop_rect
+        if rw <= 0 or rh <= 0:
+            return None
+        box = [int(rx), int(rx + rw), int(ry), int(ry + rh)]
+        logger.info(f"{hint}：框选区域 [x1,x2,y1,y2]={box}")
+        return box
+
+    def pick_custom_area(self):
+        """框选「自定义区域」（点击方式为『点击自定义区域』时用）。"""
+        box = self._pick_area_rect("框选自定义区域")
+        if not box:
+            return
+        self.custom_area_line_edit.setText(str(box))
+        # 框选完自动切到「点击自定义区域」，否则填了坐标也不会生效
+        self.click_custom_radio.setChecked(True)
+        # OCR 点击区域若还没单独框选过，就跟着走 —— 省掉「同一块地方框两遍」
+        self._sync_ocr_click_area_from_custom(box)
+
+    def pick_end_area(self):
+        """框选「终点区域」（动作类型为『滑动』时用）。"""
+        box = self._pick_area_rect("框选终点区域")
+        if not box:
+            return
+        self.end_area_line_edit.setText(str(box))
+        self.action_swipe_radio.setChecked(True)
+
+    def pick_ocr_region(self):
+        """框选「OCR搜索区域」：限定只在框内找文字，用于排除同页相同文字。"""
+        box = self._pick_area_rect("框选OCR搜索区域")
+        if not box:
+            return
+        self.ocr_region_edit.setText(str(box))
+
+    def pick_ocr_click_area(self):
+        """框选「OCR识别后点击的区域」：文字识别成功、但点在框内的随机位置。
+
+        适用场景：文字只是「判断到了某个界面」，真正要点的地方不在文字上
+        （例如文字在标题、按钮在别处）。
+        """
+        box = self._pick_area_rect("框选OCR点击区域")
+        if not box:
+            return
+        self.ocr_click_area_edit.setText(str(box))
+        # 标记「用户单独框选过」：之后改自定义区域不再覆盖这里
+        self._ocr_click_area_user_set = True
+        idx = self.ocr_action_combo.findText("点击框选区域内的随机位置")
+        if idx != -1:
+            self.ocr_action_combo.setCurrentIndex(idx)
+
+    def _sync_ocr_click_area_from_custom(self, box):
+        """把「自定义区域」的坐标同步给「OCR点击区域」。
+
+        规则（按使用习惯设计）：
+          · OCR点击区域为空       → 直接跟随，省掉重复框选；
+          · 用户单独框选过        → 不动它（尊重用户的选择）；
+          · 之前是跟着自动填的    → 跟着更新（用户改了自定义区域，OCR 也应更新）。
+        判据是「当前值是否等于上一次自动同步的值」，而不是简单看空不空。
+        """
+        try:
+            if getattr(self, "_ocr_click_area_user_set", False):
+                return
+            cur = self.ocr_click_area_edit.text().strip()
+            last_auto = getattr(self, "_ocr_click_area_auto_value", None)
+            # 空 或 与上次自动同步的值相同 → 视为「跟随中」，可以覆盖
+            if cur and last_auto is not None and cur != last_auto:
+                return
+            self.ocr_click_area_edit.setText(str(box))
+            self._ocr_click_area_auto_value = str(box)
+        except Exception:
+            pass
+
     def save(self):
         """
         保存配置（含图片替换：复制到模式目录并按改后名字落地）
@@ -738,7 +1023,7 @@ class ImageConfigDialog(QDialog):
             action_type = "click"
         self.config_data["action_type"] = action_type
 
-        # 点击后随机等待（每张图独立配置）。两个框都留空 => 移除该字段，运行时按默认 0.3~5。
+        # 点击后随机等待（每张图独立配置）。两个框都留空 => 移除该字段，运行时按默认 0.8~5。
         # 只填一个时，另一个按默认补；写反了自动交换。
         _cw_min_raw = self.click_wait_min_edit.text().strip()
         _cw_max_raw = self.click_wait_max_edit.text().strip()
@@ -747,7 +1032,7 @@ class ImageConfigDialog(QDialog):
             self.config_data.pop("click_wait_max", None)
         else:
             try:
-                _cw_min = float(_cw_min_raw) if _cw_min_raw else 0.3
+                _cw_min = float(_cw_min_raw) if _cw_min_raw else 0.8
                 _cw_max = float(_cw_max_raw) if _cw_max_raw else 5.0
             except (ValueError, TypeError):
                 QMessageBox.warning(self, "警告", "点击后随机等待格式非法，应为数字（单位秒）")
@@ -847,6 +1132,25 @@ class ImageConfigDialog(QDialog):
         if action_type == "click" and self.config_data["ocr_action"] == "点击点击区域设置的区域" and "click_area" not in self.config_data:
             QMessageBox.warning(self, "警告", "OCR操作需要点击区域，但当前未设置点击区域")
             return
+
+        # OCR 点击区域（「点击框选区域内的随机位置」专用）
+        # 留空时回退到「自定义区域」的坐标 —— 大多数情况下要点的就是同一块地方，
+        # 不必重复框选；只有用户单独框了别的位置才用自己的值。
+        if self.config_data["ocr_action"] == "点击框选区域内的随机位置":
+            _occ_raw = self.ocr_click_area_edit.text().strip()
+            _occ = _parse_click_area(_occ_raw) if _occ_raw else None
+            if _occ is None:
+                # 回退：用点击区域设置里的「自定义区域」
+                _occ = _parse_click_area(self.custom_area_line_edit.text().strip())
+            if _occ is None:
+                QMessageBox.warning(
+                    self, "警告",
+                    "OCR 动作为「点击框选区域内的随机位置」时，需要指定点击区域：\n"
+                    "可直接用上面的「自定义区域」，或用这里的「框选」单独指定。")
+                return
+            self.config_data["ocr_click_area"] = _occ
+        else:
+            self.config_data.pop("ocr_click_area", None)
 
         # 图片文件落地：复制到模式目录并按改后名字命名（含纯改名）
         if self.config_path:
@@ -1045,10 +1349,19 @@ class ModeEditorDialog(QDialog):
         self.img_list.setViewMode(QListWidget.ViewMode.IconMode)
         self.img_list.setIconSize(QtCore.QSize(100, 100))
         self.img_list.setMinimumWidth(300)
+        self.img_list.setToolTip("选中一张图按 Ctrl+C 复制（含配置），切到别的模式按 Ctrl+V 粘贴")
+        self.img_list.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
         img_layout.addWidget(self.img_list)
-        
-        # 图像操作按钮
+
+        # 剪贴板状态：告诉用户「复制了什么、可以粘到哪」
+        self.clipboard_label = QLabel("")
+        self.clipboard_label.setWordWrap(True)
+        self.clipboard_label.setStyleSheet("color: #888;")
+        img_layout.addWidget(self.clipboard_label)
+
+        # 图像操作按钮（两行：一行放不下 9 个按钮）
         img_buttons_layout = QHBoxLayout()
+        img_buttons_layout2 = QHBoxLayout()
         self.add_img_btn = QPushButton("添加图像")
         self.capture_img_btn = QPushButton("截图添加")
         self.capture_img_btn.setToolTip(
@@ -1060,6 +1373,10 @@ class ModeEditorDialog(QDialog):
         self.capture_replace_img_btn.setToolTip(
             "选中一张图，直接框选游戏画面覆盖它，文件名和配置不变（不用先存文件再选）")
         self.edit_img_config_btn = QPushButton("编辑图像配置")
+        self.copy_img_btn = QPushButton("复制图片配置")
+        self.copy_img_btn.setToolTip("复制选中的图片和它的全部配置（快捷键 Ctrl+C）")
+        self.paste_img_btn = QPushButton("粘贴图片配置")
+        self.paste_img_btn.setToolTip("把复制的图片和配置粘贴到当前选中的模式（快捷键 Ctrl+V）")
         self.usage_instructions_btn = QPushButton("查看使用说明")
 
         img_buttons_layout.addWidget(self.add_img_btn)
@@ -1067,10 +1384,14 @@ class ModeEditorDialog(QDialog):
         img_buttons_layout.addWidget(self.delete_img_btn)
         img_buttons_layout.addWidget(self.replace_img_btn)
         img_buttons_layout.addWidget(self.capture_replace_img_btn)
-        img_buttons_layout.addWidget(self.edit_img_config_btn)
-        img_buttons_layout.addWidget(self.usage_instructions_btn)
-        
+
+        img_buttons_layout2.addWidget(self.edit_img_config_btn)
+        img_buttons_layout2.addWidget(self.copy_img_btn)
+        img_buttons_layout2.addWidget(self.paste_img_btn)
+        img_buttons_layout2.addWidget(self.usage_instructions_btn)
+
         img_layout.addLayout(img_buttons_layout)
+        img_layout.addLayout(img_buttons_layout2)
         
         # 将两个区域添加到分割器
         splitter.addWidget(mode_widget)
@@ -1095,18 +1416,24 @@ class ModeEditorDialog(QDialog):
     def load_mode_tree(self):
         """
         加载模式树
+
+        `default` 是「没选子模式时」用的兜底目录，不是可选子模式，所以不在树里
+        单独显示 —— 选中模式本身（顶级节点）编辑的就是它，见 on_mode_selected。
+        早先把它当普通子模式显示，用户会以为多了一个叫 default 的子模式；
+        彻底过滤又会连它的目录名都改不了，因此保留在数据里、只在树上隐藏。
         """
         self.mode_tree.clear()
-        
+
         for mode_name, mode_data in self.temp_mode_config.items():
             root_item = QTreeWidgetItem([mode_name])
-            
+
             if isinstance(mode_data, dict):
-                for submode_name in mode_data.keys():
-                    if submode_name != 'default':
-                        sub_item = QTreeWidgetItem([submode_name])
-                        root_item.addChild(sub_item)
-            
+                for submode_name in mode_data:
+                    if submode_name == DEFAULT_SUBMODE_KEY:
+                        continue
+                    sub_item = QTreeWidgetItem([submode_name])
+                    root_item.addChild(sub_item)
+
             self.mode_tree.addTopLevelItem(root_item)
     
     def connect_signals(self):
@@ -1129,7 +1456,19 @@ class ModeEditorDialog(QDialog):
         self.replace_img_btn.clicked.connect(self.replace_image)
         self.capture_replace_img_btn.clicked.connect(self.capture_replace_image)
         self.edit_img_config_btn.clicked.connect(self.edit_image_config)
+        self.copy_img_btn.clicked.connect(self.copy_selected_image)
+        self.paste_img_btn.clicked.connect(self.paste_image)
         self.usage_instructions_btn.clicked.connect(self.show_usage_instructions)
+
+        # 右键菜单：复制/粘贴放在最顺手的位置
+        self.img_list.customContextMenuRequested.connect(self._show_img_context_menu)
+
+        # Ctrl+C / Ctrl+V 复制粘贴图片+配置。
+        # 本对话框里没有文本输入框，窗口级快捷键不会抢走文本框的复制粘贴。
+        self.copy_shortcut = QShortcut(QKeySequence.StandardKey.Copy, self)
+        self.copy_shortcut.activated.connect(self.copy_selected_image)
+        self.paste_shortcut = QShortcut(QKeySequence.StandardKey.Paste, self)
+        self.paste_shortcut.activated.connect(self.paste_image)
         
         # 底部按钮
         self.save_btn.clicked.connect(self.save)
@@ -1163,7 +1502,12 @@ class ModeEditorDialog(QDialog):
             # 子模式
             mode_name = mode_path[0]
             submode_name = mode_path[1]
-            self.mode_info_label.setText(f"当前模式: {mode_name} -> {submode_name}")
+            if submode_name == DEFAULT_SUBMODE_KEY:
+                # 说明它不是普通子模式，而是「没选子模式时」用的兜底目录
+                self.mode_info_label.setText(
+                    f"当前模式: {mode_name} -> 默认目录（未选择子模式时使用）")
+            else:
+                self.mode_info_label.setText(f"当前模式: {mode_name} -> {submode_name}")
         
         # 加载该模式的图像
         self.load_images(mode_path)
@@ -1313,6 +1657,14 @@ class ModeEditorDialog(QDialog):
                 # 删除子模式
                 mode_name = mode_path[0]
                 submode_name = mode_path[1]
+                if submode_name == DEFAULT_SUBMODE_KEY:
+                    # default 是兜底目录名，删掉后该模式在「没选子模式」时无法启动。
+                    # 想清空它请把目录名改成空以外的有效值，而不是删除这一项。
+                    QMessageBox.warning(
+                        self, "无法删除",
+                        f"「{DEFAULT_SUBMODE_KEY}」是这个模式的默认目录项，不能删除。\n"
+                        f"它决定「没选子模式时」用哪个目录；如需更换，请直接修改它的目录名。")
+                    return
                 del self.temp_mode_config[mode_name][submode_name]
             
             self.load_mode_tree()
@@ -1352,6 +1704,13 @@ class ModeEditorDialog(QDialog):
                 # 重命名子模式
                 mode_name = mode_path[0]
                 submode_name = mode_path[1]
+                if submode_name == DEFAULT_SUBMODE_KEY:
+                    # 改名会让兜底键消失（变成普通子模式），该模式就没默认目录了。
+                    QMessageBox.warning(
+                        self, "无法重命名",
+                        f"「{DEFAULT_SUBMODE_KEY}」是保留的默认目录项，不能改名。\n"
+                        f"如需调整默认目录，请修改它对应的目录名。")
+                    return
                 if new_name != submode_name:
                     if new_name not in self.temp_mode_config[mode_name]:
                         self.temp_mode_config[mode_name][new_name] = self.temp_mode_config[mode_name][submode_name]
@@ -1507,6 +1866,9 @@ class ModeEditorDialog(QDialog):
         cap = capture_size or (0, 0)
 
         # 顺手认一下框选出来的文字，填进对话框的「OCR识别文本」
+        # initial_cfg 必须先建好再写：原先先写后建，OCR 一旦认出文字就抛
+        # UnboundLocalError，表现为「截图添加」点了没反应、图也没加上。
+        initial_cfg = {}
         ocr_text, ocr_candidates = self._detect_text_on_crop(crop)
         if ocr_text:
             initial_cfg["ocr_target_text"] = ocr_text
@@ -1515,15 +1877,14 @@ class ModeEditorDialog(QDialog):
         # 框选位置 (x, y, w, h) 就是客户区坐标，和识别/点击用的是同一套坐标系，
         # 所以可以直接换算成配置里的区域格式 [x1, x2, y1, y2] 预填进去，
         # 省得用户再去猜坐标。这是「截图时记录位置」的核心。
-        initial_cfg = {}
         if crop_rect:
             rx, ry, rw, rh = crop_rect
             box = [int(rx), int(rx + rw), int(ry), int(ry + rh)]
             # ocr_region 是纯约束（留空=全窗口），预填不会改变默认行为，
             # 正好用来解决"同页两处相同文字点错位置"的问题。
             initial_cfg["ocr_region"] = box
-            # click_area 只作为参考值展示；显式写 click_type=image，
-            # 避免因为带了 click_area 就把默认点击方式悄悄切成"自定义区域"。
+            # click_area 只作为参考值展示（用户可点「框选」改成显式自定义区域）；
+            # 显式写 click_type=image，避免默认点击方式被悄悄切成「自定义区域」。
             initial_cfg["click_area"] = box
             initial_cfg["click_type"] = "image"
             logger.info(f"截图添加：{filename}  {w}x{h}  @({rx},{ry})  "
@@ -2013,32 +2374,10 @@ class ModeEditorDialog(QDialog):
         if dir_name:
             config_path = os.path.join(self.source_dir, dir_name, 'config.json')
             image_name = current_item.text()
-            
-            # 加载配置文件
-            config_data = {}
-            if os.path.exists(config_path):
-                try:
-                    with open(config_path, 'r', encoding='utf-8') as f:
-                        config = json.load(f)
-                    # 获取图像配置，pipeline 是运行时真相，优先 pipeline.tasks 格式
-                    image_key = os.path.splitext(image_name)[0]
-                    pipeline_task = None
-                    if "pipeline" in config:
-                        for task in config["pipeline"].get("tasks", []):
-                            if task.get("name") == image_key:
-                                pipeline_task = task
-                                break
-                    if pipeline_task is not None:
-                        config_data = _pipeline_task_to_image_paths(pipeline_task)
-                        # pipeline 无等价字段的 legacy 覆盖：仅 message / ocr_action / ocr_region
-                        legacy_entry = config.get("image_paths", {}).get(image_key, {})
-                        for k in ("message", "ocr_action", "ocr_region"):
-                            if k in legacy_entry and legacy_entry[k]:
-                                config_data[k] = legacy_entry[k]
-                    else:
-                        config_data = config.get("image_paths", {}).get(image_key, {})
-                except Exception as e:
-                    logger.error(f"加载配置文件失败: {e}")
+
+            # 获取图像配置：pipeline 是运行时真相，优先 pipeline.tasks 格式
+            config_data = self._load_image_config(os.path.dirname(config_path),
+                                                  os.path.splitext(image_name)[0])
             
             # 获取当前模式的所有图像名称
             image_list = []
@@ -2051,6 +2390,216 @@ class ModeEditorDialog(QDialog):
             if dialog.exec() == QDialog.DialogCode.Accepted:
                 # 重新加载图像
                 self.load_images(mode_path)
+
+    @staticmethod
+    def _load_image_config(mode_dir, image_key):
+        """读取一张图的配置（pipeline 优先，回退 image_paths），读不到返回 {}。
+
+        编辑器里「编辑配置」「复制配置」用的是同一份数据，避免两边各写一套
+        读取逻辑后显示不一致。
+        """
+        config_path = os.path.join(mode_dir, 'config.json')
+        if not os.path.exists(config_path):
+            return {}
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+        except Exception as e:
+            logger.error(f"加载配置文件失败: {e}")
+            return {}
+
+        pipeline_task = None
+        pipeline = config.get("pipeline")
+        if isinstance(pipeline, dict):
+            tasks = pipeline.get("tasks")
+            if isinstance(tasks, list):
+                for task in tasks:
+                    if isinstance(task, dict) and task.get("name") == image_key:
+                        pipeline_task = task
+                        break
+        if pipeline_task is not None:
+            data = _pipeline_task_to_image_paths(pipeline_task)
+            # pipeline 无等价字段的 legacy 覆盖：仅 message / ocr_action / ocr_region
+            image_paths = config.get("image_paths")
+            legacy_entry = image_paths.get(image_key, {}) if isinstance(image_paths, dict) else {}
+            if isinstance(legacy_entry, dict):
+                for k in ("message", "ocr_action", "ocr_region"):
+                    if k in legacy_entry and legacy_entry[k]:
+                        data[k] = legacy_entry[k]
+            return data
+
+        image_paths = config.get("image_paths")
+        entry = image_paths.get(image_key, {}) if isinstance(image_paths, dict) else {}
+        return entry if isinstance(entry, dict) else {}
+
+    def _show_img_context_menu(self, pos):
+        """图像列表右键菜单：复制/粘贴/编辑/删除"""
+        # 右键点在哪张图上就先选中它，否则菜单操作的还是上一次选中的图
+        item = self.img_list.itemAt(pos)
+        if item is not None:
+            self.img_list.setCurrentItem(item)
+
+        menu = QMenu(self)
+        copy_action = menu.addAction("复制图片配置\tCtrl+C")
+        paste_action = menu.addAction("粘贴图片配置\tCtrl+V")
+        menu.addSeparator()
+        edit_action = menu.addAction("编辑图像配置")
+        delete_action = menu.addAction("删除图像")
+
+        has_selection = self.img_list.currentItem() is not None
+        copy_action.setEnabled(has_selection)
+        edit_action.setEnabled(has_selection)
+        delete_action.setEnabled(has_selection)
+        paste_action.setEnabled(bool(_IMAGE_CLIPBOARD.get("image_name")))
+
+        chosen = menu.exec(self.img_list.mapToGlobal(pos))
+        if chosen == copy_action:
+            self.copy_selected_image()
+        elif chosen == paste_action:
+            self.paste_image()
+        elif chosen == edit_action:
+            self.edit_image_config()
+        elif chosen == delete_action:
+            self.delete_image()
+
+    def copy_selected_image(self):
+        """复制选中的图片和它的配置（Ctrl+C），供粘贴到其他模式"""
+        current_item = self.img_list.currentItem()
+        if not current_item:
+            QMessageBox.warning(self, "警告", "请先选择一张图像")
+            return
+
+        mode_path = self._get_current_mode_path()
+        if not mode_path:
+            QMessageBox.warning(self, "警告", "请先选择一个模式")
+            return
+        dir_name = self._resolve_dir_name(mode_path)
+        if not dir_name:
+            QMessageBox.warning(self, "警告", "模式对应的目录名未设置")
+            return
+
+        mode_dir = os.path.join(self.source_dir, dir_name)
+        image_name = current_item.text()
+        img_path = os.path.join(mode_dir, image_name)
+        try:
+            with open(img_path, "rb") as f:
+                image_bytes = f.read()
+        except Exception as e:
+            QMessageBox.warning(self, "警告", f"读取图片失败: {e}")
+            return
+
+        image_key = os.path.splitext(image_name)[0]
+        config_data = self._load_image_config(mode_dir, image_key)
+
+        _IMAGE_CLIPBOARD.update({
+            "image_name": image_name,
+            "image_bytes": image_bytes,
+            "config": config_data,
+            "source_mode_dir": mode_dir,
+        })
+
+        mode_label = " -> ".join(mode_path)
+        self.clipboard_label.setText(
+            f"已复制「{image_name}」（含配置）→ 切换到目标模式后按 Ctrl+V 粘贴")
+        logger.info(f"复制图片配置：{mode_label}/{image_name}（{len(image_bytes)} 字节）")
+
+    def paste_image(self):
+        """把复制的图片和配置粘贴到当前选中的模式（Ctrl+V）
+
+        重名时自动改名（foo.png → foo_copy.png → foo_copy2.png …），
+        图片文件、image_paths 和（若目标有）pipeline.tasks 三处一起写。
+        """
+        if not _IMAGE_CLIPBOARD.get("image_name"):
+            QMessageBox.information(
+                self, "提示", "剪贴板里没有图片。\n请先选中一张图片按 Ctrl+C 复制。")
+            return
+
+        mode_path = self._get_current_mode_path()
+        if not mode_path:
+            QMessageBox.warning(self, "警告", "请先选择要粘贴到的模式")
+            return
+        dir_name = self._resolve_dir_name(mode_path)
+        if not dir_name:
+            QMessageBox.warning(self, "警告", "模式对应的目录名未设置")
+            return
+
+        mode_dir = os.path.join(self.source_dir, dir_name)
+        try:
+            os.makedirs(mode_dir, exist_ok=True)
+        except Exception as e:
+            QMessageBox.warning(self, "警告", f"创建模式目录失败: {e}")
+            return
+
+        config_path = os.path.join(mode_dir, 'config.json')
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    config = json.load(f)
+                if not isinstance(config, dict):
+                    raise ValueError("配置文件根节点不是对象")
+            except Exception as e:
+                QMessageBox.warning(self, "警告", f"读取目标模式配置失败，已取消粘贴: {e}")
+                return
+        else:
+            config = {"image_paths": {}, "pipeline": {"tasks": []}}
+
+        existing_keys = set()
+        image_paths = config.get("image_paths")
+        if isinstance(image_paths, dict):
+            existing_keys.update(image_paths.keys())
+        pipeline = config.get("pipeline")
+        tasks = pipeline.get("tasks") if isinstance(pipeline, dict) else None
+        if isinstance(tasks, list):
+            for t in tasks:
+                if isinstance(t, dict) and t.get("name"):
+                    existing_keys.add(t["name"])
+
+        source_name = _IMAGE_CLIPBOARD["image_name"]
+        new_filename = _unique_paste_filename(mode_dir, source_name, existing_keys)
+        new_key = os.path.splitext(new_filename)[0]
+        old_key = os.path.splitext(source_name)[0]
+
+        cfg = _prepare_pasted_config(_IMAGE_CLIPBOARD.get("config"), old_key,
+                                     new_key, new_filename)
+        # 先在内存里改好配置（格式异常时直接中止，磁盘上不留任何痕迹）
+        try:
+            _insert_pasted_image(config, new_key, cfg)
+        except ValueError as e:
+            QMessageBox.warning(self, "警告", f"目标模式配置格式异常，已取消粘贴：{e}")
+            return
+
+        dest_path = os.path.join(mode_dir, new_filename)
+        try:
+            with open(dest_path, "wb") as f:
+                f.write(_IMAGE_CLIPBOARD.get("image_bytes") or b"")
+        except Exception as e:
+            QMessageBox.warning(self, "警告", f"写入图片失败: {e}")
+            return
+
+        try:
+            with open(config_path, 'w', encoding='utf-8') as f:
+                json.dump(config, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            # 配置写失败则把刚写进去的图删掉，避免留下「有图无配置」的孤儿文件
+            try:
+                os.remove(dest_path)
+            except Exception:
+                pass
+            QMessageBox.warning(self, "警告", f"保存配置失败: {e}")
+            return
+
+        mode_label = " -> ".join(mode_path)
+        self.clipboard_label.setText(
+            f"已粘贴「{new_filename}」到 {mode_label}（图片 + 配置）")
+        logger.info(f"粘贴图片配置：{source_name} → {mode_label}/{new_filename}")
+
+        # 刷新列表并选中新图，方便立刻继续编辑
+        self.load_images(mode_path)
+        for i in range(self.img_list.count()):
+            item = self.img_list.item(i)
+            if item.text() == new_filename:
+                self.img_list.setCurrentItem(item)
+                break
     
     def show_usage_instructions(self):
         """
@@ -2086,6 +2635,7 @@ class ModeEditorDialog(QDialog):
 <li><strong>添加图像</strong>：选择一个模式后，点击"添加图像"按钮，选择本地图像文件</li>
 <li><strong>删除图像</strong>：选择要删除的图像，点击"删除图像"按钮</li>
 <li><strong>编辑图像配置</strong>：选择图像后，点击"编辑图像配置"按钮</li>
+<li><strong>复制/粘贴图片配置</strong>：选中一张图按 <strong>Ctrl+C</strong>（或点"复制图片配置"），切到另一个模式后按 <strong>Ctrl+V</strong>（或点"粘贴图片配置"），图片文件和它的全部配置（OCR、点击区域、动作、等待时间等）会一起复制过去；重名时自动改名为 xxx_copy.png</li>
 <li><strong><span style="color: #d9534f;">注意：添加的本地的图片必须在执行窗口检测之后的游戏窗口内截图，否则会导致识别失败</span></strong></li>
 </ol>
 

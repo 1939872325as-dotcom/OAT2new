@@ -25,19 +25,19 @@ from OAT.utils.pause_state import pause_aware_sleep
 
 # 点击后随机等待的默认区间（秒）。每张图可在「编辑图像配置 → 点击区域设置 →
 # 点击后随机等待(秒)」里单独覆盖；这里是不单独配置时的回落值，与界面默认一致。
-DEFAULT_CLICK_WAIT_RANGE = (0.3, 5.0)
+DEFAULT_CLICK_WAIT_RANGE = (0.8, 5.0)
 
 
 def resolve_click_wait_range(click_wait_min, click_wait_max):
     """把配置里的等待区间解析成 (lo, hi)，规则与管道模式的解析保持完全一致：
 
-    · 两个都没填（或都非法 / 为负）→ 默认 0.3~5；
+    · 两个都没填（或都非法 / 为负）→ 默认 0.8~5；
     · 只填一个 → 另一个按默认补（只填下限 2 → 2~5）；
     · 写反了自动交换（8, 1 → 1~8）；
     · 负数 / 非数字按「没填」处理。
 
     两条路径对同一份配置必须得到同一个区间，否则「按图配置」在不同模式下
-    表现会不一致（管道模式 2~5、通用挑战模式却是 0.3~5）。
+    表现会不一致（管道模式 2~5、通用挑战模式却是 0.8~5）。
     """
     def _norm(raw):
         try:
@@ -465,7 +465,7 @@ class OnmyojiAutomation:
         :param ocr_target_text: OCR目标文字
         :param ocr_region: OCR搜索区域，客户区坐标 [x1, x2, y1, y2]；用于排除同名的其他文字
         :param ocr_confidence_threshold: OCR置信度阈值
-        :param click_wait_min: 点击后随机等待区间下限（秒），来自该图的配置；None 表示用默认 0.3
+        :param click_wait_min: 点击后随机等待区间下限（秒），来自该图的配置；None 表示用默认 0.8
         :param click_wait_max: 点击后随机等待区间上限（秒），来自该图的配置；None 表示用默认 5.0
         :param sync_type: 同步类型，可选值："完全同步"、"点击同步"
         :return: 是否成功执行操作
@@ -698,13 +698,13 @@ class OnmyojiAutomation:
             else:
                 self.send_click_message(relative_x, relative_y)
 
-        # 等待点击操作完成（区间来自该图的「点击后随机等待」配置，默认 0.3~5 秒）
+        # 等待点击操作完成（区间来自该图的「点击后随机等待」配置，默认 0.8~5 秒）
         self._sleep_after_click(click_wait_min, click_wait_max, label=label)
 
     def _sleep_after_click(self, click_wait_min=None, click_wait_max=None, label: str = None) -> None:
         """点击后的随机等待 —— 通用挑战路径的节奏控制点。
 
-        区间来自该图的「点击后随机等待」配置（默认 0.3~5 秒）。这一等替代了过去
+        区间来自该图的「点击后随机等待」配置（默认 0.8~5 秒）。这一等替代了过去
         写死在主循环里的 1.0~2.0 秒固定休眠：匹配到图时由这里主管节奏，主循环只在
         「什么都没匹配到」时做一次轻量节流（见 common_challenge.py 的 NO_MATCH_WAIT）。
         暂停不计入等待，停止则立即返回；每次都把实际秒数写进日志便于核对。

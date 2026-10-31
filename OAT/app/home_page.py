@@ -203,7 +203,10 @@ class HomePage(QWidget):
 
         self.textBrowser = TextBrowser(self)
         self.textBrowser.setObjectName("log_browser")
-        self.textBrowser.document().setMaximumBlockCount(5000)
+        # 上限别开太大：富文本文档每次插入/滚动都要重排，5000 块时单条日志
+        # 在 GUI 线程要花几百毫秒（跑几小时后点界面明显卡）。2000 条足够
+        # 实时观察，完整历史在日志文件里。
+        self.textBrowser.document().setMaximumBlockCount(2000)
         try:
             self.textBrowser.setProperty('logAutoScroll', True)
         except Exception:

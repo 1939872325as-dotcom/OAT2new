@@ -162,16 +162,22 @@ class OpenCVRecognitionEngine(RecognitionEngine):
         except Exception:
             return None
 
-    def find_template(self, template_path: str, threshold: float = None, region: Tuple = None) -> RecognitionResult:
+    def find_template(self, template_path: str, threshold: float = None, region: Tuple = None,
+                      screenshot: np.ndarray = None) -> RecognitionResult:
         if threshold is None:
             threshold = self.threshold
         else:
             threshold = _normalize_threshold(threshold)
 
-        return self._find_template_hidden(template_path, threshold, region)
+        return self._find_template_hidden(template_path, threshold, region,
+                                          screenshot=screenshot)
 
-    def _find_template_hidden(self, template_path: str, threshold: float, region: Tuple = None) -> RecognitionResult:
-        screenshot = self.capture_screenshot()
+    def _find_template_hidden(self, template_path: str, threshold: float, region: Tuple = None,
+                              screenshot: np.ndarray = None) -> RecognitionResult:
+        # 调用方可在同一任务里复用一帧（模板失败后 OCR 用同一张图），
+        # 省掉一次抓屏（PrintWindow 每次约 0.7s）。
+        if screenshot is None:
+            screenshot = self.capture_screenshot()
         if screenshot is None:
             return RecognitionResult(found=False)
 
@@ -223,8 +229,10 @@ class OpenCVRecognitionEngine(RecognitionEngine):
         return RecognitionResult(found=False)
 
     def find_text(self, target_text: str, confidence: float = 0.8,
-                  region: Tuple = None) -> RecognitionResult:
-        screenshot = self.capture_screenshot()
+                  region: Tuple = None, screenshot: np.ndarray = None) -> RecognitionResult:
+        # 同 find_template：允许复用同一帧，避免模板+OCR 一个任务截两次屏
+        if screenshot is None:
+            screenshot = self.capture_screenshot()
         if screenshot is None:
             return RecognitionResult(found=False)
 
@@ -339,8 +347,6 @@ class OpenCVRecognitionEngine(RecognitionEngine):
             except Exception:
                 return
 
-        time.sleep(random.uniform(1.5, 3.0))
-
     def swipe(self, x1: int, y1: int, x2: int, y2: int, duration: float = 0.5, sync_mode: bool = False) -> None:
         """在客户区坐标 (x1, y1) → (x2, y2) 处执行滑动"""
         try:
@@ -391,5 +397,3 @@ class OpenCVRecognitionEngine(RecognitionEngine):
                            duration=duration)
             except Exception:
                 return
-
-        time.sleep(random.uniform(1.5, 3.0))

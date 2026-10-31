@@ -263,7 +263,11 @@ class PipelineRunner:
             return self.engine.find_text(task.ocr_text or "", task.ocr_confidence,
                                          region=task.ocr_region)
         elif task.recognition == "template+ocr":
-            result = self.engine.find_template(full_path, task.threshold)
+            # 同一任务只抓一帧：模板没匹配上时，OCR 兜底复用这张图。
+            # 原来模板和 OCR 各抓一次（PrintWindow 每次约 0.7s），
+            # 两个任务一轮就要多花 2~3 秒，且两次画面可能已经变了。
+            shot = self.engine.capture_screenshot()
+            result = self.engine.find_template(full_path, task.threshold, screenshot=shot)
             if not result.found and task.ocr_text:
                 # 模板失败会静默退到 OCR —— 必须显式说明，否则用户只看到“匹配到”，
                 # 完全不知道走的不是模板（模板点击位置精确，OCR 命中的可能只是同名文字）
@@ -272,7 +276,7 @@ class PipelineRunner:
                 if task.ocr_region:
                     logger.info(f"任务 {task.name}：OCR 限定搜索区域 {list(task.ocr_region)}")
                 result = self.engine.find_text(task.ocr_text, task.ocr_confidence,
-                                               region=task.ocr_region)
+                                               region=task.ocr_region, screenshot=shot)
             return result
         else:
             return self.engine.find_template(full_path, task.threshold)
@@ -324,7 +328,7 @@ class PipelineRunner:
         """点击后随机等待区间（秒）。
 
         优先用该任务自己的配置（在「编辑图像配置」里按图设置），
-        没配则回落到默认 0.3~5 秒。
+        没配则回落到默认 0.8~5 秒。
         """
         lo = hi = None
         if task is not None:
@@ -336,7 +340,7 @@ class PipelineRunner:
         except (ValueError, TypeError):
             lo = hi = None
         if lo is None or hi is None:
-            lo, hi = 0.3, 5.0
+            lo, hi = 0.8, 5.0
         if lo < 0:
             lo = 0.0
         if hi < 0:
@@ -348,7 +352,7 @@ class PipelineRunner:
     def _sleep_after_click(self, task: Optional[Task] = None) -> None:
         """点击后的随机等待。
 
-        区间来自该图的「点击后随机等待」配置（默认 0.3~5 秒），
+        区间来自该图的「点击后随机等待」配置（默认 0.8~5 秒），
         作用：模拟人工节奏，避免固定间隔点击被识别为脚本。
         暂停不计入休眠、停止则立即返回；每次都把实际秒数写进日志便于核对。
         """
@@ -377,6 +381,18 @@ class PipelineRunner:
 
     def _resolve_click_coords(self, task: Task, result):
         """确定点击坐标（客户区逻辑坐标）；无法确定时返回 None 并记录原因"""
+        # OCR 点击区域优先：文字只是「判断到了某个界面」，真正要点的地方可能在别处
+        _occ = getattr(task, "ocr_click_area", None)
+        if _occ and len(_occ) == 4:
+            try:
+                x1, x2, y1, y2 = (int(v) for v in _occ)
+                lo_x, hi_x = min(x1, x2), max(x1, x2)
+                lo_y, hi_y = min(y1, y2), max(y1, y2)
+                return (random.randint(lo_x, hi_x), random.randint(lo_y, hi_y))
+            except (ValueError, TypeError) as e:
+                logger.error(f"任务 {task.name} 的 OCR 点击区域无效"
+                             f"（ocr_click_area={_occ}）: {e}，回退到识别区域")
+
         if task.action.target == "fixed_coord" and task.action.x_range and task.action.y_range:
             try:
                 return (

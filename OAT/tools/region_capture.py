@@ -39,6 +39,37 @@ from OAT.utils.logging import logger
 
 # ---------------------------------------------------------------- 抓图
 
+def _window_dpr(hwnd: int) -> float:
+    """窗口所在显示器的 DPI 缩放（1.0 = 100%）。
+
+    Qt6 的窗口几何用【逻辑像素】，而 Win32 的 ClientToScreen/GetWindowRect
+    返回【物理像素】。系统缩放不是 100% 时两者差一个系数；不换算会让遮罩
+    比游戏窗口大一圈、位置偏到右下，看起来就像“截图时窗口被自动放大了”。
+    取 GetDpiForWindow（Win10+），失败按 1.0 处理。
+    """
+    try:
+        import ctypes
+        dpi = int(ctypes.windll.user32.GetDpiForWindow(int(hwnd)))
+        if dpi > 0:
+            return dpi / 96.0
+    except Exception:
+        pass
+    return 1.0
+
+
+def _physical_rect_to_logical(x, y, w, h, dpr):
+    """物理像素的屏幕矩形 → Qt 逻辑矩形（四舍五入，宽高至少 1）。"""
+    try:
+        dpr = float(dpr)
+    except (TypeError, ValueError):
+        dpr = 1.0
+    if dpr <= 0:
+        dpr = 1.0
+    return QtCore.QRect(
+        int(round(float(x) / dpr)), int(round(float(y) / dpr)),
+        max(1, int(round(float(w) / dpr))), max(1, int(round(float(h) / dpr))))
+
+
 def grab_window_frame(hwnd: int):
     """后台抓取窗口客户区一帧，返回 BGR ndarray；失败返回 None。
 
@@ -159,8 +190,9 @@ class _MaskWindow(QtWidgets.QDialog):
         self.setMouseTracking(True)
 
         if target_rect is not None and target_rect.width() > 0 and target_rect.height() > 0:
-            # 贴住游戏窗口客户区：尺寸 = 图尺寸（1:1），位置 = 客户区在屏幕上的位置
-            self.setGeometry(target_rect.x(), target_rect.y(), self.w, self.h)
+            # 贴住游戏窗口客户区：位置与尺寸都由调用方换算成 Qt 逻辑像素，
+            # 这里直接采用（高 DPI 下若仍用图片原始像素当逻辑尺寸，遮罩会放大一圈）
+            self.setGeometry(target_rect)
         else:
             # 兜底：图多大窗口就多大，先放左上角，调用方负责摆位
             self.setGeometry(0, 0, self.w, self.h)
@@ -447,19 +479,22 @@ class RegionCaptureDialog(QtWidgets.QDialog):
         self.capture_size = (frame.shape[1], frame.shape[0])
 
         # 4) 算出客户区在屏幕上的位置 —— 遮罩就贴在这里，1:1 显示
+        #    物理像素 → Qt 逻辑像素：高 DPI（如 125%）下不换算，遮罩会比窗口
+        #    大一圈并向右下偏移，看起来就像“截图时窗口被自动放大了”。
+        dpr = _window_dpr(hwnd)
         target = None
         try:
             cx, cy = win32gui.ClientToScreen(hwnd, (0, 0))
-            target = QtCore.QRect(int(cx), int(cy),
-                                  int(self.capture_size[0]), int(self.capture_size[1]))
+            target = _physical_rect_to_logical(
+                cx, cy, self.capture_size[0], self.capture_size[1], dpr)
             logger.info(f"框选截图：抓到 {self.capture_size[0]}x{self.capture_size[1]}，"
-                        f"客户区屏幕位置 ({cx},{cy})")
+                        f"客户区屏幕位置 ({cx},{cy})，DPI 缩放 {dpr:.3f}")
         except Exception as e:
             logger.warning(f"框选截图：取客户区屏幕位置失败，回落到窗口矩形: {e}")
             try:
                 wr = win32gui.GetWindowRect(hwnd)
-                target = QtCore.QRect(wr[0], wr[1],
-                                      int(self.capture_size[0]), int(self.capture_size[1]))
+                target = _physical_rect_to_logical(
+                    wr[0], wr[1], self.capture_size[0], self.capture_size[1], dpr)
             except Exception:
                 target = None
 

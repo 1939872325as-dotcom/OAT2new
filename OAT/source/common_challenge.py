@@ -105,7 +105,7 @@ class CommonChallenge:
                     'ocr_action': v.get('ocr_action') or '点击文字所在区域',
                     'ocr_confidence_threshold': v.get('ocr_confidence_threshold', 0.8),
                     'ocr_region': v.get('ocr_region', None),
-                    # 点击后随机等待区间（秒）：每张图可单独配置，None 表示用默认 0.3~5
+                    # 点击后随机等待区间（秒）：每张图可单独配置，None 表示用默认 0.8~5
                     'click_wait_min': v.get('click_wait_min', None),
                     'click_wait_max': v.get('click_wait_max', None)
                 }

@@ -7,7 +7,7 @@ import threading
 import time
 import uuid
 import weakref
-from PyQt6 import QtCore
+from PyQt6 import QtCore, QtGui
 
 from loguru import logger as _lq
 
@@ -70,6 +70,19 @@ LOG_LEVELS = {
 }
 
 _DEDUP_WINDOW = 10.0  # 秒
+
+# 界面日志合并刷新参数。
+#
+# 工作线程每条日志都会排队到 GUI 线程。原先 GUI 侧逐条 insertHtml + 滚动到底，
+# 文档越大单条越慢（实测跑几小时后单条 ~0.7s，且随显示行数线性增长）：
+#   · GUI 线程被日志占满 → 点界面像卡死；
+#   · Qt 调用期间持有 GIL → 工作线程的识别/点击也被拖慢。
+# 现在 GUI 侧只做「入缓冲」，定时合并成一次插入；插入固定落在文末，
+# 与用户点过日志后光标停在哪无关。
+_DISPLAY_FLUSH_MIN_MS = 120      # 两次刷新最小间隔
+_DISPLAY_FLUSH_MAX_MS = 1500     # 刷新太慢时最多退避到 1.5s
+_DISPLAY_FLUSH_COST_FACTOR = 4   # 下次间隔 ≈ 上次刷新耗时 × 该系数
+_DISPLAY_MAX_PENDING = 500       # 缓冲上限（超出丢最旧，并提示省略条数）
 
 
 def _normalize_level(level):
@@ -645,6 +658,11 @@ class LogRedirect(QtCore.QObject):
         self.text_browser = text_browser
         self.append_log.connect(self._safe_append)
         self._log_level = 'INFO'
+        # 待刷新的显示行（HTML 片段）。只在 GUI 线程读写。
+        self._pending_html = []
+        self._dropped_count = 0   # 缓冲溢出被丢弃的行数（刷新时提示）
+        self._flush_timer = None
+        self._last_flush_ms = 0.0
         try:
             with _instances_lock:
                 _instances.add(self)
@@ -674,6 +692,12 @@ class LogRedirect(QtCore.QObject):
 
     # 将print函数输出的内容定向写入到textBrowser中
     def _safe_append(self, text):
+        """GUI 线程入口：只入缓冲，合并刷新（见 _flush_pending）。
+
+        原实现每条日志都在这里 insertHtml + 滚动到底；文档越大单条越慢，
+        GUI 线程被日志占满后点界面就会卡。现在这里只做廉价的追加，
+        真正的插入交给定时器按批完成。
+        """
         try:
             browser = self.text_browser
         except Exception:
@@ -688,6 +712,102 @@ class LogRedirect(QtCore.QObject):
                 paused = False
             if paused:
                 return
+            self._pending_html.append(str(text))
+            if len(self._pending_html) > _DISPLAY_MAX_PENDING:
+                dropped = len(self._pending_html) - _DISPLAY_MAX_PENDING
+                self._pending_html = self._pending_html[-_DISPLAY_MAX_PENDING:]
+                self._dropped_count += dropped
+            self._schedule_flush()
+        except Exception:
+            pass
+
+    def _schedule_flush(self):
+        """安排一次合并刷新；定时器必须活在 GUI 线程。"""
+        try:
+            # 没有 QApplication（无事件循环，如单元测试/纯命令行）：定时器永远不会触发，
+            # 直接同步刷新，保持原有「写入即显示」的语义。
+            try:
+                if QtCore.QCoreApplication.instance() is None:
+                    self._flush_pending()
+                    return
+            except Exception:
+                pass
+            timer = self._flush_timer
+            if timer is None:
+                # 只有与 QObject 同线程（GUI 线程）才建定时器；
+                # 若被跨线程直连调用，退回立即刷新，避免定时器永远不触发。
+                try:
+                    same_thread = QtCore.QThread.currentThread() is self.thread()
+                except Exception:
+                    same_thread = False
+                if not same_thread:
+                    self._flush_pending()
+                    return
+                timer = QtCore.QTimer(self)
+                timer.setSingleShot(True)
+                timer.setInterval(_DISPLAY_FLUSH_MIN_MS)
+                timer.timeout.connect(self._flush_pending)
+                self._flush_timer = timer
+            if not timer.isActive():
+                timer.start(self._next_flush_interval())
+        except Exception:
+            # 定时器不可用：直接刷新（至少不丢日志）
+            self._flush_pending()
+
+    def _next_flush_interval(self):
+        """刷新间隔：至少 120ms；上次刷新越慢退避越久，保证 UI 有空处理点击。"""
+        try:
+            ms = max(_DISPLAY_FLUSH_MIN_MS,
+                     int(self._last_flush_ms * _DISPLAY_FLUSH_COST_FACTOR))
+            return min(_DISPLAY_FLUSH_MAX_MS, ms)
+        except Exception:
+            return _DISPLAY_FLUSH_MIN_MS
+
+    @staticmethod
+    def _browser_can_paint(browser):
+        """窗口最小化 / 日志页不在前台时跳过排版，省下整篇文档的布局开销。"""
+        try:
+            if not browser.isVisible():
+                return False
+            win = browser.window()
+            if win is not None and win.isMinimized():
+                return False
+        except Exception:
+            pass
+        return True
+
+    def _flush_pending(self):
+        """把缓冲的日志一次性插到文档末尾（GUI 线程）。"""
+        if not self._pending_html:
+            return
+        try:
+            browser = self.text_browser
+            if browser is None:
+                self._pending_html = []
+                return
+            try:
+                if browser.property('logPaused'):
+                    self._pending_html = []
+                    self._dropped_count = 0
+                    return
+            except Exception:
+                pass
+            # 不可见时不排版：保留缓冲（有上限），等重新可见后一起显示。
+            # 这里再排一次检查，保证「最小化期间攒的日志」在窗口恢复后能显示，
+            # 而不是非要等下一条新日志。
+            if not self._browser_can_paint(browser):
+                try:
+                    if self._flush_timer is not None and not self._flush_timer.isActive():
+                        self._flush_timer.start(500)
+                except Exception:
+                    pass
+                return
+
+            pending = self._pending_html
+            self._pending_html = []
+            dropped = self._dropped_count
+            self._dropped_count = 0
+
             try:
                 auto = browser.property('logAutoScroll')
                 auto_scroll = True if auto is None else bool(auto)
@@ -699,19 +819,40 @@ class LogRedirect(QtCore.QObject):
             except Exception:
                 bar = None
                 at_bottom = True
-            # 检查text是否包含HTML标记
-            if '<font' in text or '<span' in text:
-                # 如果是HTML，使用insertHtml
-                browser.insertHtml(text + '<br>')
-            else:
-                # 如果是普通文本，使用append
-                browser.append(text)
-            # 智能自动滚动：仅当追加前已在底部且允许自动滚动时才置底；读历史不打断
+
+            # 逐条 HTML 拼成一批；非 HTML 行做转义，避免被当标签解析
+            parts = []
+            if dropped > 0:
+                parts.append(html.escape(
+                    f"…（界面刷新跟不上，省略 {dropped} 条；完整内容见日志文件）",
+                    quote=False))
+            for text in pending:
+                s = str(text)
+                if '<font' in s or '<span' in s:
+                    parts.append(s)
+                else:
+                    parts.append(html.escape(s, quote=False))
+            batch = '<br>'.join(parts) + '<br>'
+
+            t0 = time.perf_counter()
+            # 用文档级光标固定插到文末：不改变用户当前选区，
+            # 也避免用户点过日志后新日志插到光标处（那会重排整篇，极慢）
+            try:
+                cursor = QtGui.QTextCursor(browser.document())
+                cursor.movePosition(QtGui.QTextCursor.MoveOperation.End)
+                cursor.insertHtml(batch)
+            except Exception:
+                browser.insertHtml(batch)
+            # 自动滚动只做一次；读历史时（不在底部）不打断
             if auto_scroll and at_bottom and bar is not None:
                 try:
                     bar.setValue(bar.maximum())
                 except Exception:
                     pass
+            try:
+                self._last_flush_ms = (time.perf_counter() - t0) * 1000.0
+            except Exception:
+                self._last_flush_ms = 0.0
         except Exception:
             pass
 

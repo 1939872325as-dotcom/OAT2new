@@ -32,8 +32,11 @@ class Task:
     # OCR 搜索区域 (x1, x2, y1, y2)，客户区坐标；None = 全窗口。
     # 用于排除同页出现的相同文字（否则可能点到另一处同名文字）。
     ocr_region: Optional[tuple] = None
+    # OCR 命中后要点击的区域 (x1, x2, y1, y2)，客户区坐标；None = 点文字所在区域。
+    # 用于「文字在一处、真正要点的地方在另一处」的场景。
+    ocr_click_area: Optional[tuple] = None
 
-    # 点击后随机等待区间（秒），每张图可单独配置；None = 用运行时默认 0.3~5
+    # 点击后随机等待区间（秒），每张图可单独配置；None = 用运行时默认 0.8~5
     click_wait_min: Optional[float] = None
     click_wait_max: Optional[float] = None
 
@@ -86,7 +89,7 @@ def _parse_wait_range(lo_raw, hi_raw):
     if lo is None and hi is None:
         return None, None
     if lo is None:
-        lo = 0.3
+        lo = 0.8
     if hi is None:
         hi = 5.0
     if hi < lo:
@@ -116,6 +119,8 @@ def parse_pipeline(pipeline_data: dict) -> List[Task]:
             ocr_text=item.get("ocr_text"),
             ocr_confidence=item.get("ocr_confidence", 0.8),
             ocr_region=tuple(item["ocr_region"]) if item.get("ocr_region") else None,
+            ocr_click_area=(tuple(item["ocr_click_area"])
+                            if item.get("ocr_click_area") else None),
             next=item.get("next"),
             is_start=item.get("is_start", False),
             is_global=item.get("is_global", False),
