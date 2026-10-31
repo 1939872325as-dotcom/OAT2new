@@ -1,7 +1,7 @@
 # OAT2new
 
 <div align="center">
-    <img src="https://img.shields.io/badge/version-v234.1-blue.svg" alt="Version">
+    <img src="https://img.shields.io/badge/version-v234.2-blue.svg" alt="Version">
     <img src="https://img.shields.io/badge/system-Windows-blue.svg" alt="System">
     <img src="https://img.shields.io/badge/python-v3.12-blue.svg" alt="Python">
     <img src="https://img.shields.io/badge/license-GPL--3.0-green.svg" alt="License">
@@ -36,7 +36,7 @@
 
 | 功能 | 链接 |
 | --- | --- |
-| **下载最新打包版（zip）** | [**OTA2new-v234.1.zip**](https://github.com/1939872325as-dotcom/OAT2new/releases/download/OTA2new-v234.1/OTA2new-v234.1.zip) |
+| **下载最新打包版（zip）** | [**OTA2new-v234.2.zip**](https://github.com/1939872325as-dotcom/OAT2new/releases/download/OTA2new-v234.2/OTA2new-v234.2.zip) |
 | 查看版本更新内容 | [前往 Releases](https://github.com/1939872325as-dotcom/OAT2new/releases) |
 | 下载源码 | [Download ZIP](https://github.com/1939872325as-dotcom/OAT2new/archive/refs/heads/main.zip) |
 
@@ -163,7 +163,7 @@
 | 文件 | 改动 |
 | --- | --- |
 | `main.py` | **热更新启动器**：冻结运行时优先把「exe 同目录的磁盘源码」放进 `sys.path` 最前，使业务代码（`OAT/`）改动后**无需重新编译**即可生效 |
-| `OAT/tools/settings.py` | 版本号 `234.1` |
+| `OAT/tools/settings.py` | 版本号 `234.2` |
 | `OAT/source/common_challenge.py` | 删掉**跨图共享**的 `retry_count`（原来任何图片命中都自增，某张图触发过一次「连续 2 次」后，之后任意 5 次匹配就把整个挑战判为卡死并中止）；修掉 `NameError` 被裸 `except` 静默吞掉导致的「切图重置计数」失效；新增 `_build_recognition_order()` **真正读取 `recognition_order`**（此前该字段无任何代码读取，识别顺序退化成 JSON 键序）；两处裸 `except` 改为记录 warning |
 
 ### 三、差异汇总（+行 / −行）

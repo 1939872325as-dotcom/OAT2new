@@ -1,4 +1,4 @@
-APP_VERSION = "234.1"
+APP_VERSION = "234.2"
 
 import json
 import os
