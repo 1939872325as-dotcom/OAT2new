@@ -79,9 +79,9 @@ _DEDUP_WINDOW = 10.0  # 秒
 #   · Qt 调用期间持有 GIL → 工作线程的识别/点击也被拖慢。
 # 现在 GUI 侧只做「入缓冲」，定时合并成一次插入；插入固定落在文末，
 # 与用户点过日志后光标停在哪无关。
-_DISPLAY_FLUSH_MIN_MS = 120      # 两次刷新最小间隔
+_DISPLAY_FLUSH_MIN_MS = 200      # 两次刷新最小间隔
 _DISPLAY_FLUSH_MAX_MS = 1500     # 刷新太慢时最多退避到 1.5s
-_DISPLAY_FLUSH_COST_FACTOR = 4   # 下次间隔 ≈ 上次刷新耗时 × 该系数
+_DISPLAY_FLUSH_COST_FACTOR = 8   # 下次间隔 ≈ 上次刷新耗时 × 该系数
 _DISPLAY_MAX_PENDING = 500       # 缓冲上限（超出丢最旧，并提示省略条数）
 
 
@@ -803,11 +803,6 @@ class LogRedirect(QtCore.QObject):
                     pass
                 return
 
-            pending = self._pending_html
-            self._pending_html = []
-            dropped = self._dropped_count
-            self._dropped_count = 0
-
             try:
                 auto = browser.property('logAutoScroll')
                 auto_scroll = True if auto is None else bool(auto)
@@ -819,6 +814,22 @@ class LogRedirect(QtCore.QObject):
             except Exception:
                 bar = None
                 at_bottom = True
+
+            # 用户上翻读历史时先不插入：富文本文档每次插入都会按块数整篇重排
+            # （实测 ~0.04ms/块），边读边插白白烧 CPU 还会让阅读位置抖动。
+            # 缓冲保留（有上限），回到底部后的下一次刷新一起显示。
+            if auto_scroll and bar is not None and not at_bottom:
+                try:
+                    if self._flush_timer is not None and not self._flush_timer.isActive():
+                        self._flush_timer.start(500)
+                except Exception:
+                    pass
+                return
+
+            pending = self._pending_html
+            self._pending_html = []
+            dropped = self._dropped_count
+            self._dropped_count = 0
 
             # 逐条 HTML 拼成一批；非 HTML 行做转义，避免被当标签解析
             parts = []

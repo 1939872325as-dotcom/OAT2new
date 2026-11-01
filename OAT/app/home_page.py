@@ -203,10 +203,11 @@ class HomePage(QWidget):
 
         self.textBrowser = TextBrowser(self)
         self.textBrowser.setObjectName("log_browser")
-        # 上限别开太大：富文本文档每次插入/滚动都要重排，5000 块时单条日志
-        # 在 GUI 线程要花几百毫秒（跑几小时后点界面明显卡）。2000 条足够
-        # 实时观察，完整历史在日志文件里。
-        self.textBrowser.document().setMaximumBlockCount(2000)
+        # 上限别开太大：富文本文档每次插入都触发按块数的整篇重排
+        # （实测 ~0.04ms/块，2000 块时单条日志要在 GUI 线程卡 ~80ms，
+        # 日志每秒几条到达，点界面就不断撞上这些停顿）。
+        # 500 条足够实时观察，完整历史在日志文件里。
+        self.textBrowser.document().setMaximumBlockCount(500)
         try:
             self.textBrowser.setProperty('logAutoScroll', True)
         except Exception:

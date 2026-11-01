@@ -93,6 +93,31 @@ class TestDisplayBatching(unittest.TestCase):
         self.lr._flush_pending()
         self.assertIn("第 1 行日志", self.browser.toPlainText())
 
+    def test_scrolled_up_defers_insert_until_back_at_bottom(self):
+        """用户上翻读历史时不插入（避免每次插入整篇重排），回到底部后一起显示"""
+        from PyQt6.QtGui import QTextCursor
+
+        # 预填足够多的内容让滚动条有量程（窗口 300 高，每行 ~18px）
+        cur = QTextCursor(self.browser.document())
+        cur.movePosition(QTextCursor.MoveOperation.End)
+        cur.insertHtml("<br>".join(self._html(i) for i in range(80)) + "<br>")
+        self.app.processEvents()
+        bar = self.browser.verticalScrollBar()
+        self.assertGreater(bar.maximum(), 0)
+
+        # 上翻到顶部
+        bar.setValue(0)
+        self.lr._safe_append(self._html(999))
+        self.lr._flush_pending()
+        # 未插入：文档块数不变，行留在缓冲里
+        self.assertNotIn("第 999 行日志", self.browser.toPlainText())
+        self.assertEqual(len(self.lr._pending_html), 1)
+
+        # 回到底部后，下一次刷新把它带出来
+        bar.setValue(bar.maximum())
+        self.lr._flush_pending()
+        self.assertIn("第 999 行日志", self.browser.toPlainText())
+
     def test_adaptive_interval_backs_off_after_slow_flush(self):
         self.lr._last_flush_ms = 0
         self.assertEqual(self.lr._next_flush_interval(),
