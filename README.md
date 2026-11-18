@@ -36,7 +36,7 @@
 
 | 功能 | 链接 |
 | --- | --- |
-| **下载最新打包版（zip）** | [**OTA2new-v2.3.4.2.zip**](https://github.com/1939872325as-dotcom/OAT2new/releases/download/OTA2new-v2.3.4.2/OTA2new-v2.3.4.2.zip) |
+| **下载最新打包版（zip）** | [**OTA2new-v2.3.5.zip**](https://github.com/1939872325as-dotcom/OAT2new/releases/download/OTA2new-v2.3.4.2/OTA2new-v2.3.5.zip) |
 | 查看版本更新内容 | [前往 Releases](https://github.com/1939872325as-dotcom/OAT2new/releases) |
 | **2.3.5 版本说明（源码）** | [docs/发布说明-2.3.5.md](./docs/发布说明-2.3.5.md) |
 | 下载源码 | [Download ZIP](https://github.com/1939872325as-dotcom/OAT2new/archive/refs/heads/main.zip) |
