@@ -1,7 +1,7 @@
 # OAT2new
 
 <div align="center">
-    <img src="https://img.shields.io/badge/version-v2.3.4.2-blue.svg" alt="Version">
+    <img src="https://img.shields.io/badge/version-v2.3.5-blue.svg" alt="Version">
     <img src="https://img.shields.io/badge/system-Windows-blue.svg" alt="System">
     <img src="https://img.shields.io/badge/python-v3.12-blue.svg" alt="Python">
     <img src="https://img.shields.io/badge/license-GPL--3.0-green.svg" alt="License">
@@ -38,6 +38,7 @@
 | --- | --- |
 | **下载最新打包版（zip）** | [**OTA2new-v2.3.4.2.zip**](https://github.com/1939872325as-dotcom/OAT2new/releases/download/OTA2new-v2.3.4.2/OTA2new-v2.3.4.2.zip) |
 | 查看版本更新内容 | [前往 Releases](https://github.com/1939872325as-dotcom/OAT2new/releases) |
+| **2.3.5 版本说明（源码）** | [docs/发布说明-2.3.5.md](./docs/发布说明-2.3.5.md) |
 | 下载源码 | [Download ZIP](https://github.com/1939872325as-dotcom/OAT2new/archive/refs/heads/main.zip) |
 
 > 与上游一样，**exe 不进仓库**（仓库只放源码），打包版作为 **Release 资源**提供。
