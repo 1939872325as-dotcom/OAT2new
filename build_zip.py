@@ -6,13 +6,14 @@
 解压后运行 `OAT2.exe` 即可；改 `OAT/**.py` 重启即生效，无需重新编译。
 
 用法：
-    python build_zip.py                       # 默认源=..\\OAT2new，输出到源目录旁边
-    python build_zip.py --source D:\\somewhere\\OAT2new
+    python build_zip.py                       # 默认源=..\\OAT2new\\app，输出到源目录旁边
+    python build_zip.py --source D:\\somewhere\\OAT2new\\app
     python build_zip.py --output D:\\out\\OAT2new.zip
     python build_zip.py --dry-run             # 只列清单，不写 zip
 
 排除项：运行日志、Python 字节码缓存、临时目录、更新器构建产物、
-        多开启动器的本机 ini（含本机游戏路径）。
+        多开启动器的本机 ini（含本机游戏路径）、
+        CUDA / cuDNN 运行库（约 1.5GB，发布包默认走 CPU；需要 GPU 时自行放置）。
 """
 from __future__ import annotations
 
@@ -23,7 +24,8 @@ import time
 import zipfile
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_SOURCE = os.path.join(os.path.dirname(ROOT), "OAT2new")
+# 部署目录结构：OAT2new/app/ 才是程序根目录（exe + 运行库 + OAT 源码）
+DEFAULT_SOURCE = os.path.join(os.path.dirname(ROOT), "OAT2new", "app")
 
 # 目录名（任意层级命中即整个跳过）
 EXCLUDE_DIRS = {
@@ -47,10 +49,16 @@ EXCLUDE_EXTS = {
     ".tmp",
 }
 
+# 文件名前缀（大小写不敏感）：CUDA / cuDNN 运行库不进发布包
+EXCLUDE_NAME_PREFIXES = (
+    "cublas", "cudart", "cudnn", "cufft", "curand", "nvblas",
+    "onnxruntime_providers_cuda",
+)
+
 # 相对路径精确排除（本机特定状态，不应分发给别人）
 EXCLUDE_RELPATHS = {
     os.path.join("yyx", "yyx-launcher.ini"),  # 存的是本机游戏 exe 路径
-    os.path.join("config", "update_cache.json"),  # 更新检查缓存
+    os.path.join("OAT", "config", "update_cache.json"),  # 更新检查缓存
 }
 
 
@@ -62,6 +70,11 @@ def should_skip(rel_dir: str, name: str) -> bool:
     """该条目是否应排除。rel_dir 为相对源根目录的目录（根为 ""）。"""
     rel = os.path.join(rel_dir, name) if rel_dir else name
     if _norm(rel) in {_norm(p) for p in EXCLUDE_RELPATHS}:
+        return True
+    lower = name.lower()
+    if lower.startswith(EXCLUDE_NAME_PREFIXES):
+        return True
+    if ".bak" in lower:  # 覆盖 config.json.bak_xxx 这类备份
         return True
     if os.path.splitext(name)[1].lower() in EXCLUDE_EXTS:
         return True
