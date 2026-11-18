@@ -6,7 +6,9 @@
 解压后运行 `OAT2.exe` 即可；改 `OAT/**.py` 重启即生效，无需重新编译。
 
 用法：
-    python build_zip.py                       # 默认源=..\\OAT2new\\app，输出到源目录旁边
+    python build_zip.py                       # 平铺：app/ 内容直接放在 zip 根目录
+    python build_zip.py --nested              # 嵌套：运行包放进 app/，根目录可加启动器
+    python build_zip.py --nested --extra-dir release
     python build_zip.py --source D:\\somewhere\\OAT2new\\app
     python build_zip.py --output D:\\out\\OAT2new.zip
     python build_zip.py --dry-run             # 只列清单，不写 zip
@@ -101,15 +103,39 @@ def collect(source: str) -> list[tuple[str, str]]:
     return items
 
 
-def build(source: str, output: str, compress: bool = True, dry_run: bool = False) -> int:
+def collect_extra(extra_dir: str) -> list[tuple[str, str]]:
+    """根目录附加文件（启动器 / 使用说明）：不进 app/，直接放在 zip 根。"""
+    items: list[tuple[str, str]] = []
+    for dirpath, dirnames, filenames in os.walk(extra_dir):
+        rel_dir = os.path.relpath(dirpath, extra_dir)
+        if rel_dir == ".":
+            rel_dir = ""
+        dirnames[:] = [d for d in dirnames if d not in EXCLUDE_DIRS]
+        for name in sorted(filenames):
+            if os.path.splitext(name)[1].lower() in {".pyc", ".pyo", ".log", ".tmp"}:
+                continue
+            items.append((os.path.join(dirpath, name),
+                          os.path.join(rel_dir, name) if rel_dir else name))
+    return items
+
+
+def build(source: str, output: str, compress: bool = True, dry_run: bool = False,
+          nested: bool = False, extra_dir: str = "") -> int:
     if not os.path.isdir(source):
         raise SystemExit(f"[zip] 源目录不存在: {source}")
     if not os.path.isfile(os.path.join(source, "OAT2.exe")):
         raise SystemExit(f"[zip] 源目录里没有 OAT2.exe，不像是热更新部署目录: {source}")
 
     items = collect(source)
+    if nested:
+        # 运行包整体放进 app/：根目录只留启动器/说明，解压后不会散落 60 多个文件
+        items = [(p, os.path.join("app", rel)) for p, rel in items]
+    if extra_dir:
+        items.extend(collect_extra(os.path.abspath(extra_dir)))
     total = sum(os.path.getsize(p) for p, _ in items)
     print(f"[zip] 源目录 : {source}")
+    print(f"[zip] 布局   : {'嵌套 app/' if nested else '平铺'}"
+          + (f" + 根目录附加 {extra_dir}" if extra_dir else ""))
     print(f"[zip] 待打包 : {len(items)} 个文件，{total / 1024 / 1024:.1f} MB（未压缩）")
     print(f"[zip] 输出   : {output}")
 
@@ -144,6 +170,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--output", default="", help="输出 zip 路径；默认放在源目录旁边")
     ap.add_argument("--store", action="store_true", help="不压缩（更快，体积更大）")
     ap.add_argument("--dry-run", action="store_true", help="只列清单，不写 zip")
+    ap.add_argument("--nested", action="store_true",
+                    help="运行包放进 app/ 子目录（根目录可再放启动器/说明）")
+    ap.add_argument("--extra-dir", default="",
+                    help="根目录附加文件所在目录（配合 --nested，如 release/）")
     args = ap.parse_args(argv)
 
     source = os.path.abspath(args.source)
@@ -151,7 +181,8 @@ def main(argv: list[str] | None = None) -> int:
         os.path.dirname(source),
         f"OAT2new-hotfix-{time.strftime('%Y%m%d')}.zip",
     )
-    return build(source, output, compress=not args.store, dry_run=args.dry_run)
+    return build(source, output, compress=not args.store, dry_run=args.dry_run,
+                 nested=args.nested, extra_dir=args.extra_dir)
 
 
 if __name__ == "__main__":

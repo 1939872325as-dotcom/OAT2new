@@ -1,0 +1,9 @@
+﻿OAT2new v2.3.6 使用说明
+
+1. 解压到任意目录（不要在压缩包里直接运行）。
+2. 双击「启动OAT2.exe」；也可以进入 app 文件夹直接运行 OAT2.exe。
+3. 建议以管理员身份运行（游戏常以管理员运行，否则后台点击会被系统拒绝）。
+4. app\ 是程序目录：OAT2.exe、运行库、OAT 源码、rapidocr 模型、yyx 多开器都在里面，不要单独移动文件。
+5. 日志在 app\logs\；修改 app\OAT\ 下的 .py 后重启程序即生效。
+6. 本包未附带 CUDA / cuDNN 运行库，默认 CPU 运行；需要 GPU 时按发布说明自行放置。
+7. 旧版本升级：先备份自己的 app\OAT\source\ 与 app\OAT\tools\settings.json，再覆盖解压。
