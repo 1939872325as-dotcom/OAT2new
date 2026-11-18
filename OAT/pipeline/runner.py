@@ -3,6 +3,7 @@ import random
 import time
 from typing import Dict, List, Optional
 
+from OAT.utils.OCRService import ocr_service
 from OAT.utils.do_after_challenge import do_after_challenge
 from OAT.utils.logging import logger
 from OAT.utils.pause_state import is_stale, pause_aware_sleep, wait_if_paused
@@ -45,12 +46,40 @@ class PipelineRunner:
 
         # 运行时状态
         self.current_next: Optional[str] = None
+        # 等待 next 期间的「起点图复检」是否已做过（按 next 名字记，防重复点击）
+        self._start_rechecked_for: Optional[str] = None
         self.consecutive_count: Dict[str, int] = {}
         self.retry_count: int = 0
         self.next_start_time: Optional[float] = None
         self.current_task: Optional[Task] = None
         self._last_matched_task: Optional[Task] = None
         self._last_matched_task_name: Optional[str] = None
+
+        # 共享识别帧：一轮内所有任务的识别阶段复用同一帧截图（原来每任务各抓一帧，
+        # PrintWindow ~0.7s / BitBlt ~0.1s，任务多时空转一轮光截图就占掉大头）。
+        # 安全前提：一轮内只有首个命中任务会执行动作。动作执行 / 停闸等待后画面已变，
+        # 必须置脏重新抓帧；新一轮循环开始也强制置脏（帧不跨轮复用）。
+        self._shared_frame = None
+        self._frame_dirty = True
+        # 「等待命中」是否已在当前等待期内提示过：一段连续未命中只提示一次，
+        # 命中后重置（避免前端反复出现同样的提示）
+        self._wait_logged = False
+        self._wait_phase = 0
+
+    def _capture_frame(self):
+        """取共享识别帧：脏则重新抓屏，否则复用。抓屏失败返回 None（各识别函数自行兜底）。"""
+        if self._frame_dirty:
+            try:
+                self._shared_frame = self.engine.capture_screenshot()
+            except Exception:
+                self._shared_frame = None
+            self._frame_dirty = False
+        return self._shared_frame
+
+    def _invalidate_frame(self) -> None:
+        """画面已变（动作/停闸等待/新一轮），下一任务重新抓帧。"""
+        self._frame_dirty = True
+        self._shared_frame = None
 
     def run(self, times: int) -> bool:
         """执行挑战主循环"""
@@ -90,42 +119,38 @@ class PipelineRunner:
                     pass
                 # 本轮是否真的点到过图：点到过则由该图的「点击后随机等待」主管节奏，
                 # 一张都没点到才走末尾那段轻量节流（替代了原来写死的 1.0~2.0 秒）
-                acted = self._check_global_tasks()
+                # 新一轮开始：共享帧不跨轮复用（上一轮的节流等待/动作后画面可能已变）
+                self._invalidate_frame()
 
-                if self.current_next and self.current_next in self._task_map:
-                    if self._process_next_task():
-                        acted = True
-                        # 注意：_match_and_execute 已经把 current_next 改成它自己的 next 了，
-                        # 所以这里必须取「刚刚匹配到的任务」。原实现写的是
-                        # self._task_map[self.current_next] —— 拿到的是下一张任务（is_start 判错），
-                        # 而且当 next 为空时 self._task_map[None] 会 KeyError，直接崩掉整个挑战。
-                        active = self._get_last_matched()
-                        if active and active.is_start:
-                            i += 1
-                            logger.info(f"还剩{times - i}次挑战")
-                            try:
-                                logger.progress(i, times)
-                            except Exception:
-                                pass
-                            self.consecutive_count.clear()
-                            self.retry_count = 0
+                if self.SCAN_MODE == "legacy":
+                    acted = self._check_global_tasks()
+                    if self.current_next and self.current_next in self._task_map:
+                        if self._process_next_task():
+                            acted = True
+                    else:
+                        if self._process_non_global_tasks():
+                            acted = True
                 else:
-                    if self._process_non_global_tasks():
-                        acted = True
-                        active = self._get_last_matched()
-                        if active and active.is_start:
-                            i += 1
-                            logger.info(f"还剩{times - i}次挑战")
-                            try:
-                                logger.progress(i, times)
-                            except Exception:
-                                pass
-                            self.consecutive_count.clear()
-                            self.retry_count = 0
+                    # 并行模式：一帧内并发识别全部配置（整帧 OCR 一次 + 模板池并行），
+                    # 按「全局 > 流程链下一张 > 其余」择优点击
+                    acted = self._process_round()
+
+                if acted:
+                    active = self._get_last_matched()
+                    if active and active.is_start:
+                        i += 1
+                        logger.info(f"还剩{times - i}次挑战")
+                        try:
+                            logger.progress(i, times)
+                        except Exception:
+                            pass
+                        self.consecutive_count.clear()
+                        self.retry_count = 0
                 # 只有「一张图都没匹配到」时才在这里节流（暂停不计入，停止则干净退出）。
                 # 匹配到图时节奏已由该图的「点击后随机等待」负责，这里不再叠加 ——
                 # 过去写死的 random.uniform(1.0, 2.0) 就是被这一段取代的。
                 if not acted:
+                    self._log_waiting()
                     try:
                         _sleep_target = random.uniform(*NO_MATCH_WAIT_RANGE)
                     except Exception:
@@ -167,6 +192,193 @@ class PipelineRunner:
                 self.next_start_time = None
         return acted
 
+    # ---- 一帧并行扫描：整帧 OCR + 所有模板同时识别，择优点击 ----
+
+    # 并行扫描开关：parallel=一帧内并发识别全部配置（默认）；legacy=旧的顺序扫描。
+    # 出问题时可用环境变量 OAT_SCAN_MODE=legacy 一键退回，不必改代码。
+    SCAN_MODE = (os.environ.get("OAT_SCAN_MODE") or "parallel").strip().lower()
+
+    def _scan_frame_parallel(self, shot):
+        """在同一帧上并发评估所有任务，返回 [(task, result)]（仅命中的）。
+
+        为什么这么改：原来顺序扫描时，流程链等待期间只测一个任务（19:19 实测：
+        画面还有「挑战」却死等「点击屏幕继续」12 秒）；顺序扫 N 个模板也是线性
+        叠加。现在一帧内：整帧 OCR 起一次（与模板并行），模板匹配丢线程池并行，
+        模板失败的再复用那份 OCR 结果——一次扫描拿到全部配置的结论。
+        """
+        tasks = list(self.tasks)
+        if not tasks or shot is None:
+            return []
+
+        results = {}
+        # 先起 OCR（整帧一次、与模板并行；模板+OCR 任务后续复用这份结果）
+        ocr_future = None
+        try:
+            from concurrent.futures import ThreadPoolExecutor
+            workers = max(2, min(8, (os.cpu_count() or 4) - 1))
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                if any((t.recognition or "") in ("ocr", "template+ocr")
+                       and (t.ocr_text or "") for t in tasks):
+                    ocr_future = ex.submit(
+                        ocr_service.recognize_frame_items, shot)
+
+                fut_map = {}
+                for t in tasks:
+                    rec = (t.recognition or "").lower()
+                    if rec == "ocr":
+                        continue                      # 走 OCR，单独提交
+                    path = os.path.join(self.script_dir, t.template)
+                    fut_map[t.name] = ex.submit(
+                        self.engine.find_template, path, t.threshold, None, shot,
+                        getattr(t, "display", None) or t.name)
+
+                # 纯 OCR 任务：与模板并行提交
+                for t in tasks:
+                    if (t.recognition or "").lower() == "ocr":
+                        fut_map[t.name] = ex.submit(
+                            self.engine.find_text, t.ocr_text or "",
+                            t.ocr_confidence, t.ocr_region, shot)
+
+                for t in tasks:
+                    rec = (t.recognition or "").lower()
+                    fut = fut_map.get(t.name)
+                    try:
+                        result = fut.result() if fut else None
+                    except Exception as e:
+                        logger.warning(f"并行识别失败（任务 {t.name}）: {e}")
+                        result = None
+                    if result is not None and result.found:
+                        results[t.name] = result
+                        continue
+                    # 模板没命中 → 用同一帧的整帧 OCR 结果兜底（0 次额外推理）
+                    if rec == "template+ocr" and (t.ocr_text or ""):
+                        if ocr_future is not None:
+                            try:
+                                ocr_future.result()   # 确保整帧 OCR 已就绪（缓存）
+                            except Exception:
+                                pass
+                        try:
+                            r2 = self.engine.find_text(
+                                t.ocr_text, t.ocr_confidence, t.ocr_region, shot)
+                        except Exception as e:
+                            logger.warning(f"OCR 兜底失败（任务 {t.name}）: {e}")
+                            r2 = None
+                        if r2 is not None and r2.found:
+                            logger.log_to_file(f"模板未匹配，改用 OCR 兜底：任务 "
+                                               f"{getattr(t, 'display', None) or t.name}，"
+                                               f"OCR目标文字 '{t.ocr_text}'")
+                            results[t.name] = r2
+        except Exception as e:
+            logger.warning(f"并行扫描不可用，退回顺序识别: {e}")
+            for t in tasks:
+                try:
+                    r = self._recognize(t, shot)
+                except Exception:
+                    r = None
+                if r is not None and r.found:
+                    results[t.name] = r
+        return [(t, results[t.name]) for t in tasks if t.name in results]
+
+    def _log_waiting(self, extra: str = "") -> None:
+        """一轮没命中时，更新「等待命中」状态行（单行原地刷新，不刷屏）。
+
+        前端只有一行，每轮带新的识别时间（动态感）；每张模板的分数、被判
+        「不可信」的过长文本等明细都只写入后台日志文件。命中后清除这一行。
+        """
+        wait_name = ""
+        if self.current_next:
+            t = self._task_map.get(self.current_next)
+            if t is not None:
+                wait_name = f" · 正在等「{getattr(t, 'display', None) or t.name}」"
+        try:
+            total = len(self.tasks)
+            ts = time.strftime('%H:%M:%S')
+            tail = f" · {extra}" if extra else ""
+            logger.status(f"等待命中：{total} 张图像均未匹配{wait_name}"
+                          f" · 最近识别 {ts}{tail}")
+        except Exception:
+            pass
+
+    def _clear_waiting(self) -> None:
+        """命中/流程变化后清除「等待命中」状态行。"""
+        try:
+            logger.status_clear()
+        except Exception:
+            pass
+
+    def _pick_best(self, hits):
+        """按「全局 > 流程链下一张 > 其余」分层，同层取置信度最高。"""
+        if not hits:
+            return None
+        def tier(task):
+            if getattr(task, "is_global", False):
+                return 0
+            if self.current_next and task.name == self.current_next:
+                return 1
+            return 2
+        hits.sort(key=lambda p: (tier(p[0]), -float(p[1].confidence or 0.0)))
+        return hits[0]
+
+    def _process_round(self) -> bool:
+        """一轮 = 抓一帧 → 并行识别全部配置 → 择优点击。返回本轮是否点到。
+
+        流程链（current_next）仍然生效：它排在第 1 层优先级，命中就优先点它；
+        若它没出现而别的图命中，按实际画面点击并记录「流程断链」告警，
+        避免像旧逻辑那样为一个不出现的下一张空等超时。
+        """
+        task_next = self._task_map.get(self.current_next) if self.current_next else None
+        if task_next is not None:
+            if self.next_start_time is None:
+                self.next_start_time = time.time()
+            if time.time() - self.next_start_time > task_next.timeout:
+                logger.warning(f"识别超时：{getattr(task_next, 'display', None) or task_next.name}"
+                               f"（{task_next.timeout} 秒内未出现），回到默认识别模式")
+                self._timed_out_next = task_next.name
+                self.current_next = None
+                self.next_start_time = None
+                self._start_rechecked_for = None
+                self.consecutive_count.clear()
+                self.retry_count = 0
+
+        shot = self._capture_frame()
+        if shot is None:
+            return False
+
+        hits = self._scan_frame_parallel(shot)
+        chosen = self._pick_best(hits)
+        if chosen is None:
+            # 被判「不可信」的过长文本条数（如命中聊天长句）只体现在状态行，
+            # 明细已进后台文件，避免前端刷屏
+            try:
+                from .recognition_opencv import take_rejected_count
+                rejected = take_rejected_count()
+            except Exception:
+                rejected = 0
+            extra = (f"{rejected} 处文字因过长被排除（详见后台日志）"
+                     if rejected else "")
+            self._log_waiting(extra)
+            return False
+
+        task, result = chosen
+        if task_next is not None and task.name != task_next.name:
+            logger.warning(f"流程断链：本该等「{getattr(task_next, 'display', None) or task_next.name}」，"
+                           f"实际命中「{getattr(task, 'display', None) or task.name}」"
+                           f"（置信度 {result.confidence:.3f}）——按画面实际内容优先处理")
+            self.current_next = None
+            self.next_start_time = None
+
+        if not self._match_and_execute(task, pre_result=result):
+            return False
+        if task.name != self._last_matched_task_name:
+            self.retry_count = 0
+        self._update_consecutive(task.name)
+        if self._should_abort(task.name):
+            return False
+        self._last_matched_task_name = task.name
+        self.next_start_time = None
+        self._start_rechecked_for = None
+        return True
+
     def _process_next_task(self) -> bool:
         """处理 current_next 指定的任务，返回是否匹配成功"""
         task = self._task_map[self.current_next]
@@ -190,8 +402,52 @@ class PipelineRunner:
                 return False
             self._last_matched_task_name = task.name
             self.next_start_time = None
+            self._start_rechecked_for = None
             return True
+
+        # 等待 next 期间不能纯盲等：若画面仍停在「起点图」（如「挑战」），说明
+        # 上一步点击根本没生效，继续干等只会在超时前空转（实测 19:19 就是等了
+        # 12 秒、每轮只测任务2，画面上的挑战一直被忽略）。这里在宽限期后复检
+        # 一次起点任务，命中就重置流程，交给下一轮正常扫描重新点击它。
+        self._recheck_start_while_waiting()
         return False
+
+    # 等待 next 多少秒后才做起点图复检：太短会把正常转场动画误判成"没点动"
+    WAIT_START_RECHECK_DELAY = 3.0
+
+    def _recheck_start_while_waiting(self) -> None:
+        """等待 next 期间复检起点任务（每个 next 只复检一次，避免反复点击）。"""
+        if self.next_start_time is None:
+            return
+        if self._start_rechecked_for == self.current_next:
+            return                                  # 这个 next 已经复检过
+        if time.time() - self.next_start_time < self.WAIT_START_RECHECK_DELAY:
+            return
+        self._start_rechecked_for = self.current_next
+
+        for t in self.tasks:
+            if not getattr(t, "is_start", False) or t.name == self.current_next:
+                continue
+            shot = self._capture_frame()
+            if shot is None:
+                continue
+            try:
+                result = self._recognize(t, shot)
+            except Exception as e:
+                logger.debug(f"等待期起点复检失败（{t.name}）: {e}")
+                continue
+            if not result.found:
+                continue
+            logger.warning(
+                f"等待「{self.current_next}」期间画面仍显示「{t.name}」"
+                f"（{result.confidence:.3f}）：上一步点击很可能没有生效，"
+                f"重置流程并重新处理 {t.name}")
+            self.current_next = None
+            self.next_start_time = None
+            self._start_rechecked_for = None
+            self.consecutive_count.clear()
+            self.retry_count = 0
+            return
 
     def _process_non_global_tasks(self) -> bool:
         """遍历所有非全局任务，返回是否匹配到任一任务"""
@@ -209,22 +465,28 @@ class PipelineRunner:
     def _get_last_matched(self) -> Optional[Task]:
         return getattr(self, "_last_matched_task", None)
 
-    def _match_and_execute(self, task: Task) -> bool:
-        """对单个任务执行识别 → 点击 → 状态更新"""
+    def _match_and_execute(self, task: Task, pre_result=None) -> bool:
+        """对单个任务执行识别 → 点击 → 状态更新。
+
+        pre_result：并行扫描已经算好的识别结果；传入时跳过重复识别
+        （否则并行扫描 + 这里再扫一遍等于双倍开销）。
+        """
         self.current_task = task
-        result = self._recognize(task)
-        if not result.found:
+        shot = self._capture_frame()
+        result = pre_result if pre_result is not None else self._recognize(task, shot)
+        if result is None or not result.found:
             return False
 
+        self._clear_waiting()
         via = f"OCR('{result.text}')" if result.text else "模板匹配"
-        logger.info(f"匹配到: {task.name}（方式: {via}，置信度: {result.confidence:.3f}，"
+        logger.info(f"匹配到: {getattr(task, 'display', None) or task.name}（方式: {via}，置信度: {result.confidence:.3f}，"
                     f"识别区域: {result.region}，"
                     f"设定: 阈值={task.threshold} ocr阈值={task.ocr_confidence} "
                     f"下一张={task.next or '无'}{'，挑战起点' if task.is_start else ''}）")
 
         # 上一轮等它的 next 等超时了、现在它又匹配到：说明上一步的点击没生效
         if getattr(self, "_timed_out_next", None) == task.name:
-            logger.warning(f"任务 {task.name} 再次匹配到，但它设定的下一张「{task.next}」之前已超时未出现："
+            logger.warning(f"任务 {getattr(task, 'display', None) or task.name} 再次匹配到，"
                            f"上一步的点击很可能没有生效（或该步本就不需要点击）")
             self._timed_out_next = None
 
@@ -237,7 +499,41 @@ class PipelineRunner:
                            f"若这不是你要点的位置，请把 OCR 目标文字改成完整文字，"
                            f"或用「OCR搜索区域」限定范围")
 
+        # 停止点击闸（优先级高于动作执行）：任一停止条件图出现在画面上 →
+        # 本轮不执行该任务的动作，按「停止时间」等待后按「未匹配」处理
+        # （不更新 next / 不通知同步器 / 不计入连续命中）。
+        if task.stop_click_enabled and task.stop_images:
+            _hit = self._find_stop_image(task, shot)
+            if _hit:
+                try:
+                    _seconds = max(0.0, float(task.stop_time))
+                except (ValueError, TypeError):
+                    _seconds = 5.0
+                logger.info(f"停止条件命中（图 {os.path.basename(_hit)} 出现），"
+                            f"本轮不执行任务 {task.name} 的动作，停止 {_seconds:g} 秒")
+                if _seconds > 0:
+                    try:
+                        if not pause_aware_sleep(_seconds, 0.1):
+                            return False
+                    except Exception:
+                        time.sleep(_seconds)
+                # 停闸等待期间画面可能已变（暂停可能停了很久）：共享帧作废
+                self._invalidate_frame()
+                return False
+
+        # 暂停检查点：识别完成后、执行点击前再确认一次。循环顶部的检查点只拦
+        # 下一轮，拦不住本轮收尾——暂停请求落在识别阶段（模板×N + OCR 兜底，
+        # 可长达数秒）时，若不在这里等一下，机器人会多点击一次才停。
+        # 收到停止请求则返回 False，由外层按「未匹配」路径干净退出。
+        try:
+            if wait_if_paused() < 0:
+                return False
+        except Exception:
+            pass
+
         self._execute_action(task, result)
+        # 动作已执行（含点击后随机等待），画面已变：共享帧作废
+        self._invalidate_frame()
         self._last_matched_task = task
 
         # 同步器通知
@@ -249,37 +545,66 @@ class PipelineRunner:
             self.current_next = task.next
         else:
             self.current_next = None
+        self._start_rechecked_for = None      # 新一段等待，允许重新复检起点图
 
         self.next_start_time = None
         return True
 
-    def _recognize(self, task: Task):
-        """根据任务配置选择识别方式"""
+    def _find_stop_image(self, task: Task, shot=None) -> Optional[str]:
+        """按配置顺序检查停止条件图，返回第一个命中的相对路径；都没命中返回 None。
+
+        所有停止图与模板/OCR 识别共用同一帧（shot 为共享识别帧），逐张各抓一帧太贵；
+        识别失败按未命中处理不阻断流程。
+        """
+        if not task.stop_images:
+            return None
+        if shot is None:
+            try:
+                shot = self.engine.capture_screenshot()
+            except Exception:
+                shot = None
+        for rel in task.stop_images:
+            full_path = os.path.join(self.script_dir, rel)
+            try:
+                if self.engine.find_template(full_path, task.threshold, screenshot=shot).found:
+                    return rel
+            except Exception as e:
+                logger.warning(f"停止图识别失败（按未命中处理）: {rel}: {e}")
+        return None
+
+    def _recognize(self, task: Task, shot=None):
+        """根据任务配置选择识别方式（shot 为共享识别帧，None 时各识别函数自行抓屏）"""
         full_path = os.path.join(self.script_dir, task.template)
 
         if task.recognition == "ocr":
             if task.ocr_region:
-                logger.info(f"任务 {task.name}：OCR 限定搜索区域 {list(task.ocr_region)}")
+                logger.debug(f"任务 {task.name}：OCR 限定搜索区域 {list(task.ocr_region)}")
             return self.engine.find_text(task.ocr_text or "", task.ocr_confidence,
-                                         region=task.ocr_region)
+                                         region=task.ocr_region, screenshot=shot)
         elif task.recognition == "template+ocr":
             # 同一任务只抓一帧：模板没匹配上时，OCR 兜底复用这张图。
-            # 原来模板和 OCR 各抓一次（PrintWindow 每次约 0.7s），
-            # 两个任务一轮就要多花 2~3 秒，且两次画面可能已经变了。
-            shot = self.engine.capture_screenshot()
-            result = self.engine.find_template(full_path, task.threshold, screenshot=shot)
+            # 共享帧由 _capture_frame 提供；共享帧缺失时此处自行抓一张并兜底复用。
+            if shot is None:
+                try:
+                    shot = self.engine.capture_screenshot()
+                except Exception:
+                    shot = None
+            result = self.engine.find_template(full_path, task.threshold, screenshot=shot,
+                                               display=getattr(task, "display", None))
             if not result.found and task.ocr_text:
                 # 模板失败会静默退到 OCR —— 必须显式说明，否则用户只看到“匹配到”，
                 # 完全不知道走的不是模板（模板点击位置精确，OCR 命中的可能只是同名文字）
-                logger.warning(f"模板未匹配，改用 OCR 兜底：任务 {task.name}，模板 {task.template}，"
-                               f"OCR目标文字 '{task.ocr_text}'")
+                logger.log_to_file(f"模板未匹配，改用 OCR 兜底：任务 "
+                                   f"{getattr(task, 'display', None) or task.name}，"
+                                   f"OCR目标文字 '{task.ocr_text}'")
                 if task.ocr_region:
-                    logger.info(f"任务 {task.name}：OCR 限定搜索区域 {list(task.ocr_region)}")
+                    logger.debug(f"任务 {task.name}：OCR 限定搜索区域 {list(task.ocr_region)}")
                 result = self.engine.find_text(task.ocr_text, task.ocr_confidence,
                                                region=task.ocr_region, screenshot=shot)
             return result
         else:
-            return self.engine.find_template(full_path, task.threshold)
+            return self.engine.find_template(full_path, task.threshold, screenshot=shot,
+                                             display=getattr(task, "display", None))
 
     def _execute_action(self, task: Task, result) -> None:
         """执行任务匹配后的动作（click / swipe / wait，pipeline 专属）"""
@@ -475,8 +800,8 @@ def create_and_run_pipeline(
     """
     from OAT.tools import settings
 
-    if threshold is None:
-        threshold = settings.FIND_THRESHOLD
+    # 不在这里把 settings.FIND_THRESHOLD 取成固定值：传 None 下去，让识别引擎
+    # 每轮现读设置，这样设置页拖「识别阈值」能对正在跑的挑战实时生效。
     if find_mode is None:
         find_mode = settings.FIND_MODE
 

@@ -195,13 +195,29 @@ def _short_time(ts):
             return ''
 
 
+# isDarkTheme 5 秒 TTL 缓存：每条日志都要查主题色，原来每条都走一次 Qt 调用
+# （且是在发日志的工作线程里触碰 Qt 对象）。主题切换后最多 5 秒内换色，可忽略。
+_dark_cache = None  # (time.monotonic(), bool)
+
+
+def _is_dark_theme_cached() -> bool:
+    global _dark_cache
+    try:
+        now = time.monotonic()
+        cached = _dark_cache
+        if cached is not None and now - cached[0] < 5.0:
+            return cached[1]
+        from qfluentwidgets.common.config import isDarkTheme
+        dark = bool(isDarkTheme())
+        _dark_cache = (now, dark)
+        return dark
+    except Exception:
+        return False
+
+
 def _build_display_html(timestamp, level, message, caller='', window=''):
     """显示行格式（display only）：`● HH:MM:SS message`，圆点按级别着色，模块进 tooltip。"""
-    try:
-        from qfluentwidgets.common.config import isDarkTheme
-        _dark = isDarkTheme()
-    except Exception:
-        _dark = False
+    _dark = _is_dark_theme_cached()
     try:
         color = _color_for(level, _dark)
     except Exception:
@@ -267,6 +283,27 @@ def _emit_to_browsers(html):
                     continue
                 seen_browsers.add(key)
             inst.append_log.emit(html)
+        except Exception:
+            continue
+
+
+def _emit_status_to_browsers(text, active):
+    """把「状态行」广播给绑定了浏览器的 LogRedirect 实例（同一浏览器只投一次）。"""
+    try:
+        with _instances_lock:
+            targets = list(_instances)
+    except Exception:
+        targets = []
+    seen = set()
+    for inst in targets:
+        try:
+            tb = getattr(inst, 'text_browser', None)
+            if tb is not None:
+                key = id(tb)
+                if key in seen:
+                    continue
+                seen.add(key)
+            inst.status_changed.emit(str(text or ''), bool(active))
         except Exception:
             continue
 
@@ -358,11 +395,13 @@ def _display_sink(message):
             ts = _get_timestamp()
         now = time.time()
         key = (level, raw_msg)
-        flush_html = None
-        emit_html = None
+        flush_info = None   # (p_level, p_count)：待补发的「…（xN）」行
+        emit_now = False
         need_timer = False
         global _dedup_last_key, _dedup_count, _dedup_last_time
         try:
+            # 锁内只更新去重计数；HTML 构建（含 Qt 主题查询）放锁外，
+            # 否则所有工作线程的日志都在这把锁上串行排队
             with _dedup_lock:
                 if _dedup_last_key is not None and key == _dedup_last_key and (now - _dedup_last_time) < _DEDUP_WINDOW:
                     _dedup_count += 1
@@ -370,24 +409,28 @@ def _display_sink(message):
                     need_timer = True
                 else:
                     if _dedup_last_key is not None and _dedup_count > 1:
-                        try:
-                            p_level = _dedup_last_key[0]
-                            p_count = _dedup_count
-                            flush_html = _build_display_html(ts, p_level, f"...（x{p_count}）")
-                        except Exception:
-                            flush_html = None
+                        flush_info = (_dedup_last_key[0], _dedup_count)
                     _dedup_last_key = key
                     _dedup_count = 1
                     _dedup_last_time = now
-                    try:
-                        emit_html = _build_display_html(ts, level, raw_msg, _caller0, _window0)
-                    except Exception:
-                        emit_html = f"\u25cf {_short_time(ts)} {raw_msg}"
+                    emit_now = True
         except Exception:
+            emit_now = True
+        flush_html = None
+        emit_html = None
+        if flush_info is not None:
+            try:
+                flush_html = _build_display_html(ts, flush_info[0], f"...（x{flush_info[1]}）")
+            except Exception:
+                flush_html = None
+        if emit_now:
             try:
                 emit_html = _build_display_html(ts, level, raw_msg, _caller0, _window0)
             except Exception:
-                return
+                try:
+                    emit_html = f"\u25cf {_short_time(ts)} {raw_msg}"
+                except Exception:
+                    return
         if need_timer:
             _ensure_flush_timer()
             return
@@ -649,14 +692,46 @@ class _BoundLogger:
             pass
 
 
+def _breath_gradient(c_dark: str, c_bright: str, steps: int = 8):
+    """生成「暗→亮→暗」的圆点呼吸色阶（每 step 一帧，往返共 2N-2 帧）。
+
+    单一亮/暗两帧切换像闪烁；用多帧渐变（黄色系）才像呼吸灯。
+    """
+    def _rgb(h):
+        h = h.lstrip('#')
+        return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+
+    d, b = _rgb(c_dark), _rgb(c_bright)
+    up = []
+    for i in range(steps):
+        t = i / float(steps - 1) if steps > 1 else 1.0
+        up.append('#%02X%02X%02X' % tuple(
+            int(round(d[k] + (b[k] - d[k]) * t)) for k in range(3)))
+    return up + up[-2:0:-1]          # 暗→亮→暗，平滑往复
+
+
+# 圆点呼吸色阶：白 → 浅黄 → 深黄 → 浅黄 → 白（10 帧去，18 帧往返）
+# 白到深黄之间本身就是浅黄过渡，所以两段线性插值即可得到自然的黄系呼吸。
+_STATUS_BREATH_COLORS = _breath_gradient('#FFFFFF', '#FFB300', 10)
+
+
 class LogRedirect(QtCore.QObject):
     append_log = QtCore.pyqtSignal(str)
     progress_updated = QtCore.pyqtSignal(int, int)
+    # 状态行（单行动态文本，如「等待命中 + 最近识别时间」）：不追加新行，
+    # 只更新文档末尾同一行；带呼吸灯效果。第二个参数 = 是否激活。
+    status_changed = QtCore.pyqtSignal(str, bool)
 
     def __init__(self, text_browser=None):
         super().__init__()
         self.text_browser = text_browser
         self.append_log.connect(self._safe_append)
+        self.status_changed.connect(self._apply_status)
+        # 状态行内部状态（只在 GUI 线程使用）
+        self._status_active = False
+        self._status_text = ''
+        self._status_breath_idx = 0     # 圆点当前色阶帧（0..len-1，往复）
+        self._status_timer = None
         self._log_level = 'INFO'
         # 待刷新的显示行（HTML 片段）。只在 GUI 线程读写。
         self._pending_html = []
@@ -689,6 +764,182 @@ class LogRedirect(QtCore.QObject):
         :param text_browser: QTextBrowser 实例
         """
         self.text_browser = text_browser
+
+    # ---- 单行动态状态（呼吸灯） ----
+
+    # 呼吸节奏：每帧 250ms，18 帧往复 ≈ 4.5s 一次完整呼吸（比之前慢一倍多）
+    _STATUS_TICK_MS = 250
+    _STATUS_DOT_ON = '#FFFFFF'     # 最亮：白
+    _STATUS_DOT_OFF = '#FFB300'    # 最暗：深黄
+
+    def _status_html(self) -> str:
+        try:
+            idx = int(getattr(self, '_status_breath_idx', 0)) % len(_STATUS_BREATH_COLORS)
+            color = _STATUS_BREATH_COLORS[idx]
+        except Exception:
+            color = self._STATUS_DOT_ON
+        try:
+            body = html.escape(str(self._status_text), quote=False)
+        except Exception:
+            body = str(self._status_text)
+        # 只有前面的圆点做「黄色渐变呼吸」；文字颜色保持不变，
+        # 否则整行忽明忽暗，读起来像在闪。
+        return (f'<span style="color:{color}">&#9679;</span> '
+                f'<span>{body}</span>')
+
+    def status(self, text):
+        """更新状态行（同一行原地刷新，不追加日志行）。
+
+        用于「等待命中」这类持续状态：调用方每轮都可以带新的时间戳，
+        界面上始终只有一行，读起来是动态的，不会刷屏。
+        """
+        try:
+            msg = str(text)
+        except Exception:
+            return
+        try:
+            _emit_status_to_browsers(msg, True)
+        except Exception:
+            pass
+
+    def status_clear(self):
+        """清除状态行（命中/流程切换时调用）。"""
+        try:
+            _emit_status_to_browsers('', False)
+        except Exception:
+            pass
+
+    def _clear_status_block(self):
+        """只删除「状态行」自己那个选区（绝不碰其它正常日志）。"""
+        cur = getattr(self, '_status_cursor', None)
+        self._status_cursor = None
+        if cur is None:
+            return
+        try:
+            if cur.isNull():
+                return
+            cur.removeSelectedText()
+        except Exception:
+            pass
+
+    def _apply_status(self, text, active):
+        """GUI 线程：更新状态行（原地替换它自己），并按需启停呼吸定时器。
+
+        状态行用 QTextCursor 选区精确锁定：更新=替换该选区，清除=删该选区，
+        **不会误删其它日志行**（之前的"删末尾块"实现会误伤最后一条正常日志）。
+        """
+        try:
+            if self.text_browser is None:
+                return
+            self._status_text = str(text or '')
+            if not active:
+                self._status_active = False
+                self._clear_status_block()
+                self._stop_status_timer()
+                return
+            self._status_active = True
+            if getattr(self, '_status_cursor', None) is not None:
+                try:
+                    self._rewrite_status_block()
+                    self._ensure_status_timer()
+                    return
+                except Exception:
+                    self._status_cursor = None
+            self._append_status_block()
+            self._ensure_status_timer()
+        except Exception:
+            pass
+
+    def _rewrite_status_block(self):
+        """原地重写状态行：先删掉它自己的选区，再在同一位置插入新内容。
+
+        直接 insertHtml 到有选区的光标，Qt 的行为并不总是「替换」，实测会变成
+        追加（状态行越滚越长），所以这里显式 removeSelectedText 再插入。
+        """
+        cur = self._status_cursor
+        doc = self.text_browser.document()
+        cur.beginEditBlock()
+        try:
+            cur.removeSelectedText()
+            start = cur.position()
+            cur.insertHtml(self._status_html())
+            end = cur.position()
+        finally:
+            try:
+                cur.endEditBlock()
+            except Exception:
+                pass
+        sel = QtGui.QTextCursor(doc)
+        sel.setPosition(start)
+        sel.setPosition(end, QtGui.QTextCursor.MoveMode.KeepAnchor)
+        self._status_cursor = sel
+
+    def _append_status_block(self):
+        """在文末新起一行写入状态行，并记录其选区光标。"""
+        try:
+            browser = self.text_browser
+            if browser is None or not self._status_active:
+                return
+            doc = browser.document()
+            cur = QtGui.QTextCursor(doc)
+            cur.movePosition(QtGui.QTextCursor.MoveOperation.End)
+            try:
+                cur.insertBlock()          # 状态行独占一行，不粘在上一条日志后面
+            except Exception:
+                pass
+            start = cur.position()
+            cur.insertHtml(self._status_html())
+            end = cur.position()
+            sel = QtGui.QTextCursor(doc)
+            sel.setPosition(start)
+            sel.setPosition(end, QtGui.QTextCursor.MoveMode.KeepAnchor)
+            self._status_cursor = sel
+            try:
+                bar = browser.verticalScrollBar()
+                auto = browser.property('logAutoScroll')
+                if auto is None or bool(auto):
+                    bar.setValue(bar.maximum())
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _ensure_status_timer(self):
+        try:
+            if self._status_timer is not None:
+                if not self._status_timer.isActive():
+                    self._status_timer.start(self._STATUS_TICK_MS)
+                return
+            try:
+                if QtCore.QCoreApplication.instance() is None:
+                    return
+            except Exception:
+                return
+            timer = QtCore.QTimer(self)
+            timer.setInterval(self._STATUS_TICK_MS)
+            timer.timeout.connect(self._status_tick)
+            timer.start()
+            self._status_timer = timer
+        except Exception:
+            self._status_timer = None
+
+    def _stop_status_timer(self):
+        try:
+            if self._status_timer is not None:
+                self._status_timer.stop()
+        except Exception:
+            pass
+
+    def _status_tick(self):
+        """呼吸灯：亮/暗交替重绘状态行（仍只有一行）。"""
+        try:
+            if not self._status_active or self.text_browser is None:
+                self._stop_status_timer()
+                return
+            self._status_breath_idx = (int(getattr(self, '_status_breath_idx', 0)) + 1)                 % len(_STATUS_BREATH_COLORS)
+            self._apply_status(self._status_text, True)
+        except Exception:
+            pass
 
     # 将print函数输出的内容定向写入到textBrowser中
     def _safe_append(self, text):
@@ -846,6 +1097,11 @@ class LogRedirect(QtCore.QObject):
             batch = '<br>'.join(parts) + '<br>'
 
             t0 = time.perf_counter()
+            # 状态行必须始终在文末：新日志插入前先摘掉它，插完再补回，
+            # 否则日志会挤在状态行下面，看起来像状态行卡住了。
+            _status_on = bool(getattr(self, '_status_active', False))
+            if _status_on:
+                self._clear_status_block()
             # 用文档级光标固定插到文末：不改变用户当前选区，
             # 也避免用户点过日志后新日志插到光标处（那会重排整篇，极慢）
             try:
@@ -854,6 +1110,8 @@ class LogRedirect(QtCore.QObject):
                 cursor.insertHtml(batch)
             except Exception:
                 browser.insertHtml(batch)
+            if _status_on:
+                self._append_status_block()
             # 自动滚动只做一次；读历史时（不在底部）不打断
             if auto_scroll and at_bottom and bar is not None:
                 try:

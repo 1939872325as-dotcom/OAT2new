@@ -104,6 +104,16 @@ class OnmyojiAutomation:
         # 初始化公共参数
         self._init_common_params(find_mode, find_threshold)
     
+    @property
+    def default_confidence(self) -> float:
+        """识别阈值（0~1）。未显式指定时实时读设置：拖「识别阈值」滑块立即生效。"""
+        if getattr(self, "_threshold_explicit", False):
+            return self._default_confidence
+        try:
+            return float(settings.FIND_THRESHOLD) / 100.0
+        except Exception:
+            return self._default_confidence
+
     def _init_common_params(self, find_mode=None, find_threshold=None):
         """初始化公共参数"""
         # 线程与控制变量
@@ -116,9 +126,11 @@ class OnmyojiAutomation:
         # 设置识别模式和阈值
         # 优先使用传入的参数，其次使用settings.py中的配置
         self.find_mode = find_mode if find_mode else settings.FIND_MODE
-        # 获取阈值并转换为0-1之间的值
-        threshold_value = find_threshold if find_threshold is not None else settings.FIND_THRESHOLD
-        self.default_confidence = threshold_value / 100.0  # 转换为0-1之间的值
+        # 阈值：显式传入就固定用（测试/特殊流程），否则每次识别现读设置——
+        # 这样设置页拖「识别阈值」对正在执行的操作实时生效，不必重建对象。
+        self._threshold_explicit = find_threshold is not None
+        self._default_confidence = ((float(find_threshold) if find_threshold is not None
+                                     else float(settings.FIND_THRESHOLD)) / 100.0)
         self.image_templates = {}
 
         # 创建WindowCapture实例，用于隐藏窗口模式
@@ -413,8 +425,9 @@ class OnmyojiAutomation:
         # 发送鼠标左键按下消息
         win32gui.PostMessage(self.hwnd, win32con.WM_LBUTTONDOWN, win32con.MK_LBUTTON, l_param)
         
-        # 增加鼠标按下时长，确保点击被正确识别
-        time.sleep(0.2)
+        # 增加鼠标按下时长，确保点击被正确识别；与 pipeline 一致用 200~250ms 随机，
+        # 避免固定时长成为机械点击特征
+        time.sleep(random.uniform(0.20, 0.25))
         
         # 发送鼠标左键释放消息
         win32gui.PostMessage(self.hwnd, win32con.WM_LBUTTONUP, 0, l_param)
@@ -451,6 +464,8 @@ class OnmyojiAutomation:
                        ocr_confidence_threshold: float = None,
                        click_wait_min: float = None,
                        click_wait_max: float = None,
+                       stop_images: list = None,
+                       stop_time: float = None,
                        # sync_type: str = "完全同步"
                        ) -> bool:
         """
@@ -467,6 +482,8 @@ class OnmyojiAutomation:
         :param ocr_confidence_threshold: OCR置信度阈值
         :param click_wait_min: 点击后随机等待区间下限（秒），来自该图的配置；None 表示用默认 0.8
         :param click_wait_max: 点击后随机等待区间上限（秒），来自该图的配置；None 表示用默认 5.0
+        :param stop_images: 停止条件图绝对路径列表（出现图片停止点击）；None/空 = 未配置
+        :param stop_time: 命中停止条件后等待的秒数；None 表示用默认 5.0
         :param sync_type: 同步类型，可选值："完全同步"、"点击同步"
         :return: 是否成功执行操作
         """
@@ -474,7 +491,33 @@ class OnmyojiAutomation:
             # 使用设置中的阈值作为默认值
             if threshold is None:
                 threshold = self.default_confidence
-                
+
+            # 停止点击闸（优先级最高，先于一切点击路径）：任一停止条件图出现在画面上
+            # → 本轮不点击该图，按 stop_time 停止后按「未命中」返回（模板点击 / OCR 点击 /
+            # 坐标点击三条路径全部拦在入口处）。未命中则继续往下走正常点击链路。
+            if stop_images:
+                _hit = None
+                for _p in stop_images:
+                    try:
+                        if self.find_img(_p):
+                            _hit = _p
+                            break
+                    except Exception:
+                        pass
+                if _hit:
+                    try:
+                        _wait = float(stop_time) if stop_time is not None else 5.0
+                    except (ValueError, TypeError):
+                        _wait = 5.0
+                    logger.info(f"停止条件命中（图 {os.path.basename(_hit)} 出现），"
+                                f"本轮不点击 {os.path.basename(logo)}，停止 {_wait:g} 秒")
+                    if _wait > 0:
+                        try:
+                            pause_aware_sleep(_wait, 0.1)
+                        except Exception:
+                            time.sleep(_wait)
+                    return False
+
             # 如果启用了OCR，先尝试OCR识别（自定义点击区域时跳过，直达坐标分支）
             if ocr_enabled and ocr_target_text and not self._should_skip_ocr_for_custom_area(
                     ocr_enabled, ocr_target_text, ocr_action, click_type, click_area):

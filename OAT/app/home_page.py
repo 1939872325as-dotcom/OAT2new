@@ -196,6 +196,12 @@ class HomePage(QWidget):
         self.log_pause_btn.setChecked(False)
         self.log_pause_btn.setFixedWidth(72)
         self.log_pause_btn.toggled.connect(self._on_log_pause_toggled)
+        # 暂停确认轮询：点「暂停」后工作线程要走到检查点才真正停下（识别阶段可长
+        # 达数秒），期间按钮显示「暂停中…」并忽略再次点击——否则用户以为没点上
+        # 而连点，第二次点击会把刚发出的暂停又切换回「继续」（实测 bug）。
+        self._pause_ack_timer = QtCore.QTimer(self)
+        self._pause_ack_timer.setInterval(100)
+        self._pause_ack_timer.timeout.connect(self._poll_pause_ack)
 
         log_toolbar.addWidget(self.log_progress_widget, 0)
         log_toolbar.addWidget(self.log_pause_btn, 0)
@@ -278,17 +284,84 @@ class HomePage(QWidget):
             paused = False
         try:
             if paused:
+                # 发出暂停请求；真正生效要等工作线程走到检查点，期间显示「暂停中…」
                 pause_state.pause()
-            else:
-                pause_state.resume()
+                try:
+                    self._pause_ack_timer.start()
+                except Exception:
+                    pass
+                try:
+                    self.log_pause_btn.setText('暂停中…')
+                except Exception:
+                    pass
+                try:
+                    logger.info("已暂停挑战")
+                except Exception:
+                    pass
+                return
+            if pause_state.pause_pending():
+                # 暂停还没被工作线程确认就收到「取消」：视为连点误触，
+                # 不恢复运行，把按钮按回暂停态（blockSignals 防止再次触发 toggled）
+                try:
+                    self.log_pause_btn.blockSignals(True)
+                    self.log_pause_btn.setChecked(True)
+                    self.log_pause_btn.blockSignals(False)
+                except Exception:
+                    pass
+                return
+            pause_state.resume()
+            try:
+                self._pause_ack_timer.stop()
+            except Exception:
+                pass
+            try:
+                self.log_pause_btn.setText('暂停')
+            except Exception:
+                pass
+            try:
+                logger.info("已继续挑战")
+            except Exception:
+                pass
         except Exception:
             pass
+
+    def _poll_pause_ack(self):
+        """轮询暂停请求是否已被工作线程确认；确认后把文案从「暂停中…」换成「继续」。"""
         try:
-            self.log_pause_btn.setText('继续' if paused else '暂停')
-        except Exception:
-            pass
-        try:
-            logger.info("已暂停挑战" if paused else "已继续挑战")
+            try:
+                checked = self.log_pause_btn.isChecked()
+            except Exception:
+                checked = False
+            if not checked:
+                # 按钮已被其他路径复位（如新开局 progress 重置）：停轮询并还原文案
+                try:
+                    self._pause_ack_timer.stop()
+                except Exception:
+                    pass
+                try:
+                    self.log_pause_btn.setText('暂停')
+                except Exception:
+                    pass
+                return
+            try:
+                pending = pause_state.pause_pending()
+            except Exception:
+                pending = False
+            if pending:
+                try:
+                    self.log_pause_btn.setText('暂停中…')
+                except Exception:
+                    pass
+                return
+            # 已确认（或长时间无工作线程确认而超时）：恢复常规文案，停轮询
+            try:
+                self._pause_ack_timer.stop()
+            except Exception:
+                pass
+            try:
+                self.log_pause_btn.setText('继续')
+            except Exception:
+                pass
         except Exception:
             pass
 

@@ -103,6 +103,23 @@ class SettingsPage(QWidget):
         )
         group.addSettingCard(self.close_game_card)
 
+        # 启动自动提权：游戏常以管理员运行，普通权限下窗口自动调整会被 UIPI 拒绝
+        _elevate_icon = getattr(FIF, 'CERTIFICATE', None) or FIF.INFO
+        self.auto_elevate_card = SwitchSettingCard(
+            _elevate_icon, "启动时以管理员运行",
+            "自动提权重启（UAC 确认一次）。游戏以管理员运行时，"
+            "不提权将无法自动调整窗口大小",
+            parent=self
+        )
+        self.auto_elevate_card.checkedChanged.connect(
+            lambda checked: update_settings('auto_elevate', bool(checked))
+        )
+        self.auto_elevate_checkbox = self.auto_elevate_card.switchButton
+        self.auto_elevate_checkbox.setChecked(
+            bool(settings_data.get('auto_elevate', True))
+        )
+        group.addSettingCard(self.auto_elevate_card)
+
         self.capture_window_mode = ComboBox(self)
         self.capture_window_mode.addItems(["PrintWindow", "BitBlt"])
         capture_val = settings_data.get('capture_window_mode', 'PrintWindow')

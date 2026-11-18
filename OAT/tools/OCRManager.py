@@ -1,8 +1,8 @@
 import os
 
 import cv2
-from rapidocr import RapidOCR
 
+from OAT.utils.OCREnginePool import OCREnginePool
 from OAT.utils.logging import logger
 
 
@@ -20,19 +20,45 @@ class OCRManager:
         self.last_match_confidence = 0.0
     
     def _init_reader(self):
-        """延迟初始化OCR reader"""
+        """延迟初始化OCR reader
+
+        reader 现在是 OCREnginePool（CPU+GPU 双引擎动态调度，见 OAT/utils/OCREnginePool.py）。
+        infer(img) 的返回值与原 RapidOCR(img) 一致，调用方无感。
+        OAT_OCR_MODE=cpu 可退回纯单引擎行为。
+        """
         if self.reader is None:
             try:
                 logger.info('正在初始化OCR引擎')
-                # 初始化RapidOCR（支持中英文识别）
-                self.reader = RapidOCR(
-                    params={
-                        "Det.box_thresh": 0.8,  # 文本检测阈值，取值：0.1~0.9 | 越大=越严格（只框清晰文字）| 越小=越宽松（容易框背景）
-                        "Det.unclip_ratio": 1.8,  # 增大文本框大小，取值：1.0~2.5 | 越大=框越大 | 越小=框紧贴文字
-                        "Global.text_score": 0.7,  # 文字识别置信度阈值， 取值：0.1~0.9 | 低于该值的识别结果会被丢弃
-                        "Det.max_side_len": 960  # 设置最大边长，避免图像过大
-                    }
-                )
+                # det/rec 强制指到 PP-OCRv6 模型：exe 内编译的 rapidocr 是老版本，
+                # 默认用 PP-OCRv4 det，对暗色底艺术字小图（如『准备』）检测不出框
+                # （2026-11-16 实测复现，v6 同图 conf=1.0）。模型文件放在
+                # 根目录 rapidocr/models/（数据目录，随源码热更新生效，无需重打包）。
+                # 注意 OCRManager 在 OAT/tools/ 下，到根目录要 dirname 三次。
+                model_dir = os.path.join(
+                    os.path.dirname(os.path.dirname(os.path.dirname(
+                        os.path.abspath(__file__)))),
+                    'rapidocr', 'models')
+                det_v6 = os.path.join(model_dir, 'PP-OCRv6_det_small.onnx')
+                rec_v6 = os.path.join(model_dir, 'PP-OCRv6_rec_small.onnx')
+                extra = {}
+                if os.path.exists(det_v6):
+                    extra["Det.model_path"] = det_v6
+                if os.path.exists(rec_v6):
+                    extra["Rec.model_path"] = rec_v6
+                if extra:
+                    logger.info(f'OCR模型升级: 使用 PP-OCRv6 det/rec（{len(extra)}个）'
+                                f' @ {model_dir}')
+                else:
+                    logger.warning(f'OCR模型升级: v6 模型未找到于 {model_dir}，'
+                                   f'回落编译版默认（v4）')
+                # 初始化OCR引擎池（内部按环境决定单CPU还是CPU+GPU双引擎）
+                self.reader = OCREnginePool(base_params={
+                    "Det.box_thresh": 0.8,  # 文本检测阈值，取值：0.1~0.9 | 越大=越严格（只框清晰文字）| 越小=越宽松（容易框背景）
+                    "Det.unclip_ratio": 1.8,  # 增大文本框大小，取值：1.0~2.5 | 越大=框越大 | 越小=框紧贴文字
+                    "Global.text_score": 0.7,  # 文字识别置信度阈值， 取值：0.1~0.9 | 低于该值的识别结果会被丢弃
+                    "Det.max_side_len": 960,  # 设置最大边长，避免图像过大
+                    **extra
+                })
                 logger.info('OCR引擎初始化完成')
             except Exception as e:
                 logger.error(f"OCR初始化失败: {str(e)}")
@@ -65,13 +91,18 @@ class OCRManager:
                 return False, None, None
             
             # 读取图片
-            img = cv2.imread(image_input)
+            from OAT.utils.image_io import imread as _imread_safe
+            img = _imread_safe(image_input)
             if img is None:
                 logger.error(f"无法读取图片：{image_input}")
                 return False, None, None
         else:
             # 直接使用图像对象
             img = image_input
+            # 空图守卫：识别对象路径与 recognize_all_text 对齐，空图不进引擎
+            # （否则浪费一次 GPU 推理，rapidocr 内部还会打 det 空告警）
+            if img is None or getattr(img, "size", 0) == 0:
+                return False, None, None
 
         # 可选：只在 region 指定的范围内做 OCR（语义与 click_area 一致：[x1, x2, y1, y2]）
         offset_x = 0
@@ -102,8 +133,10 @@ class OCRManager:
         if self.reader is None:
             return False, None, None
         
-        # 使用RapidOCR进行识别
-        results = self.reader(img)
+        # 使用OCR引擎池进行识别（CPU+GPU 动态分配）
+        results = self.reader.infer(img)
+        if debug and hasattr(self.reader, 'stats_line'):
+            logger.info(f"[OCR Debug] 引擎池负载: {self.reader.stats_line()}")
 
         found = False
         text_area = None
@@ -142,6 +175,18 @@ class OCRManager:
                 # 选择顺序：完全相等优先 → 达到置信度阈值者优先 → 置信度最高者；
                 # 并列时保留 OCR 原始顺序（自上而下、自左而右），保证结果确定可复现。
                 exact = [c for c in candidates if c['text'].strip() == target_text.strip()]
+                if not exact:
+                    # 防误点（与整帧路径同一规则）：目标太短时子串会命中一整句
+                    # 无关文字（实测『挑战』命中顶部横幅系统消息 → 点错位置）。
+                    # 命中文本比目标长 3 字以上即视为不可信，直接判未命中。
+                    _tl = len(target_text.strip())
+                    near = [c for c in candidates
+                            if len(c['text'].strip()) <= _tl + 3]
+                    if not near:
+                        logger.log_to_file(f"OCR: '{target_text}' 只命中过长文本"
+                                           f"（如 '{candidates[0]['text'][:20]}…'），判定不可信")
+                        return found, text_area, real_text
+                    candidates = near
                 pool = exact if exact else candidates
                 passed = [c for c in pool if c['confidence'] >= confidence_threshold]
                 chosen = max(passed if passed else pool, key=lambda c: c['confidence'])
@@ -195,7 +240,8 @@ class OCRManager:
                 if not os.path.exists(image_input):
                     logger.error(f"图片不存在：{image_input}")
                     return []
-                img = cv2.imread(image_input)
+                from OAT.utils.image_io import imread as _imread_safe
+                img = _imread_safe(image_input)
                 if img is None:
                     logger.error(f"无法读取图片：{image_input}")
                     return []
@@ -205,16 +251,57 @@ class OCRManager:
             if img is None or getattr(img, "size", 0) == 0:
                 return []
 
-            # 与 find_text_offline 保持同样的预处理，保证识别口径一致
-            img = cv2.convertScaleAbs(img, alpha=1.5, beta=0)
-
             self._init_reader()
             if self.reader is None:
                 return []
 
-            results = self.reader(img)
-            if not getattr(results, 'txts', None):
+            # 多变体识别（自动填文字场景专用，不追求运行时口径一致）：
+            # 候选依次跑，取「识别条数最多、总置信最高」的那一版：
+            # 1) 原始图 + box_thresh=0.5 —— 暗字亮底/亮字暗底两种极性都能检出；
+            # 2) 放大 2x（仅小图）—— 大字艺术字排版（如『召唤鬼王』2x2 排布）
+            #    原始尺寸下 det 常只框到上排，放大后两排都能框出（实测 92x108：
+            #    原始仅『召唤』，2x 得『召唤』+『鬼王』）；
+            # 3) 提对比度兜底（低对比界面）——注意不能当默认，alpha=1.5 会让
+            #    暗字亮底的图 det 全空（2026-11-16 实测）。
+            variants = [("原始", img)]
+            h, w = img.shape[:2]
+            if max(h, w) < 260:
+                variants.append(("2x放大", cv2.resize(
+                    img, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)))
+            variants.append(("提对比度", cv2.convertScaleAbs(img, alpha=1.5, beta=0)))
+
+            # 择优标准：先看「最长单条文本 × 该条置信度」，再看总置信。
+            # 不能用「条数多」当第一优先——拆行会让条数虚高：实测『伤害排名』
+            # 原始图拆成 ['伤','方害排名']（2 条，含错字）而提对比度是
+            # ['伤害排名']（1 条，conf 1.0），按条数会选到错的拆行版本，
+            # 自动填文字就只剩一个字。也不能"≥2 条就提前退出"（同理）。
+            best = None          # ((最长*置信, 置信和), results)
+            for _name, v in variants:
+                try:
+                    res = self.reader.infer(v, box_thresh=0.5)
+                except Exception:
+                    continue
+                txts = getattr(res, 'txts', None)
+                if txts is None or len(txts) == 0:
+                    continue
+                scores = getattr(res, 'scores', None)
+                try:
+                    pairs = [(str(t or '').strip(), float(scores[i]))
+                             for i, t in enumerate(txts)]
+                except Exception:
+                    pairs = [(str(t or '').strip(), 0.0) for t in txts]
+                pairs = [(t, c) for t, c in pairs if t]
+                if not pairs:
+                    continue
+                best_item = max((len(t) * c, c) for t, c in pairs)
+                score = (round(best_item[0], 6),
+                         round(float(sum(c for _t, c in pairs)), 6),
+                         len(pairs))
+                if best is None or score > best[0]:
+                    best = (score, res)
+            if best is None:
                 return []
+            results = best[1]
 
             try:
                 lo = float(min_confidence)

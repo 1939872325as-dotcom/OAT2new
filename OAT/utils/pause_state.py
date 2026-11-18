@@ -27,11 +27,22 @@ _gen = 0
 _gen_lock = threading.Lock()
 _local = threading.local()
 
+# 暂停请求的「待确认」窗口：pause() 记录请求时刻，工作线程在检查点观察到暂停时
+# 确认（ack）。UI 层用 pause_pending() 显示「暂停中…」并忽略确认前的再次点击，
+# 防止用户以为没点上而连点，把刚发出的暂停又切换回「继续」（实测 bug：两次点击
+# 间隔 112ms，暂停被自己的第二次点击取消）。一直没有工作线程确认（例如没有挑战
+# 在跑）时按 TTL 自动过期为 False，UI 不会卡在「暂停中…」。
+_PAUSE_PENDING_TTL = 5.0
+_pause_req_ts = 0.0
+_pause_ack_ts = 0.0
+
 
 def pause() -> None:
     """请求全局暂停（幂等，永不抛异常）。"""
+    global _pause_req_ts
     try:
         _paused.set()
+        _pause_req_ts = time.monotonic()
     except Exception:
         pass
 
@@ -48,6 +59,25 @@ def is_paused() -> bool:
     """当前是否处于暂停状态（永不抛异常）。"""
     try:
         return bool(_paused.is_set())
+    except Exception:
+        return False
+
+
+def pause_pending() -> bool:
+    """暂停请求是否尚未被任何工作线程确认（永不抛异常）。
+
+    pause() 后为 True；任一工作线程在检查点（_drain_pause）观察到暂停后为 False；
+    持续无确认超过 _PAUSE_PENDING_TTL 秒（如没有挑战在跑）也返回 False。
+    UI 层据此显示「暂停中…」并在确认前忽略再次点击。
+    """
+    try:
+        if not _paused.is_set():
+            return False
+        if _pause_ack_ts >= _pause_req_ts:
+            return False
+        if time.monotonic() - _pause_req_ts >= _PAUSE_PENDING_TTL:
+            return False
+        return True
     except Exception:
         return False
 
@@ -200,6 +230,7 @@ def reset() -> None:
 
 def _drain_pause() -> float:
     """阻塞直到暂停解除；停止则返回 -1.0，否则返回 0.0。永不抛异常。"""
+    global _pause_ack_ts
     try:
         while True:
             try:
@@ -207,6 +238,12 @@ def _drain_pause() -> float:
                     return -1.0
                 if not _paused.is_set():
                     return 0.0
+                # 工作线程在这里观察到暂停：确认 UI 的暂停请求（pause_pending → False）
+                try:
+                    if _pause_ack_ts < _pause_req_ts:
+                        _pause_ack_ts = time.monotonic()
+                except Exception:
+                    pass
                 # 在停止位上等待：request_stop 立刻唤醒；resume 靠轮询感知
                 if _stopped.wait(_PAUSE_POLL):
                     return -1.0

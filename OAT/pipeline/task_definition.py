@@ -25,6 +25,10 @@ class Task:
     template: str  # 模板图片路径（相对 mode 目录）
     recognition: str = "template"  # template, ocr, template+ocr
 
+    # 显示名（纯展示用，来自 config 的 label，通常是 OCR 文字）；
+    # 日志/界面优先显示它，没有才退回文件名。不影响识别与点击。
+    label: Optional[str] = None
+
     # 识别参数
     threshold: Optional[float] = None
     ocr_text: Optional[str] = None
@@ -54,6 +58,18 @@ class Task:
 
     # 同一任务连续匹配预算（达到即判停；结算等长驻界面可调大，如 zuihou=20）
     max_consecutive: int = 5
+
+    # 停止点击（出现图片停止点击）：命中任一停止图时，本轮不执行该任务的动作，
+    # 按停止时间等待后按「未匹配」处理。停止图路径相对 mode 目录。
+    stop_click_enabled: bool = False
+    stop_images: Optional[List[str]] = None
+    stop_time: float = 5.0
+
+    @property
+    def display(self) -> str:
+        """日志/界面显示名：优先 label（通常是 OCR 文字），没有才用文件名。"""
+        lab = (self.label or "").strip()
+        return lab or self.name
 
 
 def _parse_max_consecutive(raw) -> int:
@@ -115,6 +131,7 @@ def parse_pipeline(pipeline_data: dict) -> List[Task]:
             name=item["name"],
             template=item["template"],
             recognition=item.get("recognition", "template"),
+            label=item.get("label"),
             threshold=item.get("threshold"),
             ocr_text=item.get("ocr_text"),
             ocr_confidence=item.get("ocr_confidence", 0.8),
@@ -131,5 +148,15 @@ def parse_pipeline(pipeline_data: dict) -> List[Task]:
         )
         task.click_wait_min, task.click_wait_max = _parse_wait_range(
             item.get("click_wait_min"), item.get("click_wait_max"))
+
+        # 停止点击（出现图片停止点击）：字段缺失/非法时回退默认（不启用 / 无图 / 5 秒）
+        task.stop_click_enabled = bool(item.get("stop_click_enabled", False))
+        _si = item.get("stop_images")
+        task.stop_images = ([str(p) for p in _si if p]
+                            if isinstance(_si, list) and _si else None)
+        try:
+            task.stop_time = float(item.get("stop_time", 5.0))
+        except (ValueError, TypeError):
+            task.stop_time = 5.0
         tasks.append(task)
     return tasks

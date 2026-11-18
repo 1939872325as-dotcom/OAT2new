@@ -71,9 +71,8 @@ class CommonChallenge:
         # 识别顺序（默认按 config 中 image_paths 的书写顺序）
         self.ordered_keys = []
         
-        # 使用设置中的阈值和识别模式
-        if self.threshold is None:
-            self.threshold = settings.FIND_THRESHOLD
+        # 识别模式取设置默认；阈值不在此固化——传 None 给自动化对象，
+        # 让它每次识别现读设置，运行中拖「识别阈值」滑块即可实时生效
         if self.find_mode is None:
             self.find_mode = settings.FIND_MODE
         
@@ -107,7 +106,11 @@ class CommonChallenge:
                     'ocr_region': v.get('ocr_region', None),
                     # 点击后随机等待区间（秒）：每张图可单独配置，None 表示用默认 0.8~5
                     'click_wait_min': v.get('click_wait_min', None),
-                    'click_wait_max': v.get('click_wait_max', None)
+                    'click_wait_max': v.get('click_wait_max', None),
+                    # 停止点击（出现图片停止点击）：命中任一停止图则本轮不点击该图
+                    'stop_click_enabled': v.get('stop_click_enabled', False),
+                    'stop_images': v.get('stop_images', []) or [],
+                    'stop_time': v.get('stop_time', None)
                 }
             else:
                 # 兼容旧格式
@@ -125,11 +128,58 @@ class CommonChallenge:
                     'ocr_confidence_threshold': 0.8,
                     'ocr_region': None,
                     'click_wait_min': None,
-                    'click_wait_max': None
+                    'click_wait_max': None,
+                    'stop_click_enabled': False,
+                    'stop_images': [],
+                    'stop_time': None
                 }
             
             self.image_paths[k] = path
-            # 预加载图像以提高后续识别速度
+
+        # 配置文件里可能残留已删除图片的条目（旧版编辑器只删 png 不删配置）。
+        # 这类死条目一旦进入识别序列，每轮都会拿不存在的路径去匹配，只刷错误日志、
+        # 永远不命中，还会拖慢整轮。这里按文件是否存在做一次过滤，把它们剔出序列。
+        # 必须在 preload 之前过滤：否则每轮启动都白读一次不存在的文件。
+        missing = [k for k, p in self.image_paths.items() if not os.path.exists(p)]
+        for k in missing:
+            del self.image_paths[k]
+            self.image_info.pop(k, None)
+        if missing:
+            logger.warning(
+                f"配置中有 {len(missing)} 个图像条目对应的文件不存在，已跳过: {', '.join(missing)}"
+            )
+            # 悬空引用清理：next_image 指向被剔除的图时清空，避免流程等一个永不命中的图
+            for info in self.image_info.values():
+                if info.get('next_image') in missing:
+                    info['next_image'] = None
+
+        # 解析停止点击配置：把停止图相对路径解析成绝对路径，缺文件的剔除并告警；
+        # 一条可用都没有就按未配置处理。必须在 preload 循环前完成，停止图也一并预加载。
+        for k, info in self.image_info.items():
+            info['stop_images_abs'] = None
+            if not info.get('stop_click_enabled') or not info.get('stop_images'):
+                continue
+            _abs_list = []
+            for rel in info['stop_images']:
+                _p = os.path.join(self.script_dir, rel)
+                if os.path.exists(_p):
+                    _abs_list.append(_p)
+                else:
+                    logger.warning(f"停止图文件不存在，已忽略: {_p}（图 {k}）")
+            if _abs_list:
+                info['stop_images_abs'] = _abs_list
+                try:
+                    info['stop_time'] = float(
+                        info.get('stop_time') if info.get('stop_time') is not None else 5.0)
+                except (ValueError, TypeError):
+                    info['stop_time'] = 5.0
+                for _p in _abs_list:
+                    self.automation_obj.preload_image(_p)
+            else:
+                logger.warning(f"图 {k} 配置了停止点击但没有可用的停止图，已按未配置处理")
+
+        # 预加载存活下来的模板
+        for path in self.image_paths.values():
             self.automation_obj.preload_image(path)
 
         self._build_recognition_order()
@@ -152,6 +202,57 @@ class CommonChallenge:
         if declared:
             logger.info(f"识别顺序: {' -> '.join(self.ordered_keys)}")
     
+    def _ensure_window_size(self, tol: int = 2, warn_every_rounds: int = 20):
+        """窗口尺寸守卫：客户区偏离设置目标超过 tol 像素时自动调整回目标尺寸。
+
+        模板图按设置里的「自定义分辨率」截取，客户区一变所有模板按比例失配。
+        常见成因：手动拖拽、游戏/模拟器自适配缩放。调整失败（权限不足）只告警不阻塞。
+        """
+        try:
+            from OAT.tools.WindowChecker import WindowChecker
+            target_w = int(settings.settings_data.get('custom_res_width', 1441))
+            target_h = int(settings.settings_data.get('custom_res_height', 812))
+            hwnd = self.automation_obj.hwnd if self.automation_obj else self.window_hwnd
+            if not hwnd:
+                return
+            wc = WindowChecker()
+            cw, ch = wc._get_client_size(hwnd)
+            if cw <= 0 or ch <= 0:
+                return
+            # 物理 vs 逻辑：游戏是 DPI-UNAWARE 时，实际应有的客户区是「逻辑×系统缩放」
+            # （125% 屏幕上 1417x798 的逻辑目标 → 1771x998 物理），
+            # 用逻辑值直接比会永远差 25%、每轮都触发一次无谓 resize。
+            phys_w, phys_h = wc._physical_target_size(hwnd, target_w, target_h)
+            # 容差随 DPI 系数放大（1.25 倍换算 + 边框取整会带来 2~3px 偏差）
+            _sc = wc._dpi_scale_for_window(hwnd) or 1.0
+            _tol = max(tol, int(round(tol * _sc)) + 1)
+            if abs(cw - phys_w) <= _tol and abs(ch - phys_h) <= _tol:
+                self._size_guard_warned = False
+                return
+            # 尺寸漂了：恢复 + 告警（每 warn_every_rounds 轮提醒一次，避免刷屏）
+            self._size_guard_count = getattr(self, '_size_guard_count', 0) + 1
+            should_warn = (self._size_guard_count == 1
+                           or self._size_guard_count % warn_every_rounds == 0)
+            if should_warn:
+                logger.warning(
+                    f'窗口客户区 {cw}x{ch} 偏离目标 逻辑 {target_w}x{target_h}'
+                    f'（物理 {phys_w}x{phys_h}；模板按逻辑尺寸截取，偏离会导致全部识别失败）'
+                    f'——正在自动恢复')
+            wc.resize_window(target_w, target_h, hwnd=hwnd)
+            # 等待生效（最多 1.5s），失败则下轮再试
+            import time as _t
+            deadline = _t.time() + 1.5
+            while _t.time() < deadline:
+                if wc._size_close(wc._get_client_size(hwnd), (phys_w, phys_h)):
+                    if should_warn:
+                        logger.info('窗口尺寸已恢复到目标，识别继续')
+                    self._size_guard_count = 0
+                    break
+                _t.sleep(0.15)
+        except Exception as e:
+            # 守卫绝不能打断挑战主流程
+            logger.warning(f'窗口尺寸守卫执行失败（忽略）: {e}')
+
     def run(self) -> bool:
         """
         执行挑战操作
@@ -173,6 +274,11 @@ class CommonChallenge:
                 # 本轮是否真的点到过图：点到过则由该图的「点击后随机等待」主管节奏，
                 # 一张都没点到才走末尾那段轻量节流（替代了原来写死的 1.0~2.0 秒）
                 acted = False
+                # 窗口尺寸守卫：客户区偏离设置目标超过容差时，模板全部匹配不上，
+                # 循环会变成【静默空转】（每轮节流 0.7~2s，日志一条不出，看起来像卡死）。
+                # 这里每轮检查并自动恢复尺寸 + 告警，把这种状态显性化。（实测踩坑：
+                # 游戏窗口被缩到基准的 80% 后，挑战线程无声空转了数分钟毫无日志。）
+                self._ensure_window_size()
                 # 全局协同暂停：暂停时阻塞等待；收到停止请求则干净退出
                 try:
                     if wait_if_paused() < 0:
@@ -213,7 +319,9 @@ class CommonChallenge:
                             ocr_target_text=info['ocr_target_text'],
                             ocr_action=info['ocr_action'],
                             click_wait_min=info['click_wait_min'],
-                            click_wait_max=info['click_wait_max']
+                            click_wait_max=info['click_wait_max'],
+                            stop_images=info.get('stop_images_abs'),
+                            stop_time=info.get('stop_time')
                         ):
                             acted = True
                             if info['message']:
@@ -256,7 +364,9 @@ class CommonChallenge:
                                     ocr_region=info['ocr_region'],
                                     ocr_confidence_threshold=info['ocr_confidence_threshold'],
                                     click_wait_min=info['click_wait_min'],
-                                    click_wait_max=info['click_wait_max']
+                                    click_wait_max=info['click_wait_max'],
+                                    stop_images=info.get('stop_images_abs'),
+                                    stop_time=info.get('stop_time')
                                 ):
                                     acted = True
                                     # 增加连续出现次数（重试次数由同一张图的连续命中次数推导）

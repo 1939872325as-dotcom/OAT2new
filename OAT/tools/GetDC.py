@@ -4,6 +4,8 @@ import win32con
 import numpy as np
 import cv2
 import ctypes
+import threading
+import time
 from ctypes import wintypes
 from typing import Optional, Tuple, Union
 import pyscreeze
@@ -74,7 +76,8 @@ class WindowCapture:
             self.hwnd = win32gui.FindWindow(None, window_title)
             if not self.hwnd:
                 warning_box(f"未找到窗口: {window_title}")
-                raise
+                # 裸 raise（无活动异常）只会抛出无关的 RuntimeError，掩盖真实原因
+                raise RuntimeError(f"未找到窗口: {window_title}")
         elif not self.hwnd:
             # 使用当前活动窗口
             self.hwnd = win32gui.GetForegroundWindow()
@@ -91,6 +94,17 @@ class WindowCapture:
         self._capture_cooldown = False  # 冷却标志
         self._cooldown_duration = 30.0  # 冷却时间（秒）
         self._last_capture_failure = 0.0  # 上次捕获失败的时间戳
+
+        # 跨帧复用的 GDI 画布（BitBlt/PrintWindow 共用）：原来每帧
+        # GetDC→CreateDCFromHandle→CreateCompatibleDC→CreateBitmap→全销毁，
+        # 识别循环每秒多次截图时这些建毁占了每帧本地耗时的相当一部分。
+        # 只在尺寸变化/异常时重建；位图常驻选中在 saveDC 内。
+        self._canvas_lock = threading.RLock()
+        self._canvas_hwnddc = None
+        self._canvas_mfcdc = None
+        self._canvas_savedc = None
+        self._canvas_bmp = None
+        self._canvas_size = (0, 0)
 
     def get_window_info(self) -> Optional[Tuple[Tuple[int, int], Tuple[int, int], Tuple[int, int]]]:
         """获取窗口的位置和尺寸信息"""
@@ -146,12 +160,77 @@ class WindowCapture:
             except:
                 pass
 
+    @staticmethod
+    def _destroy_gdi(hwnd, hWndDC, mfcDC, saveDC, saveBitMap):
+        """按 GDI 释放语义清理一组截图对象：先删 saveDC（解除位图选中）再删位图，
+        否则 DeleteObject 对选中态位图静默失败。"""
+        if saveDC:
+            try:
+                saveDC.DeleteDC()
+            except Exception:
+                pass
+        if saveBitMap:
+            try:
+                win32gui.DeleteObject(saveBitMap.GetHandle())
+            except Exception:
+                pass
+        if mfcDC:
+            try:
+                mfcDC.DeleteDC()
+            except Exception:
+                pass
+        if hWndDC:
+            try:
+                win32gui.ReleaseDC(hwnd, hWndDC)
+            except Exception:
+                pass
+
+    def _get_canvas(self, width: int, height: int) -> None:
+        """取跨帧复用的画布；尺寸变化或首次调用时重建。失败时清理半截状态后上抛。"""
+        with self._canvas_lock:
+            if self._canvas_savedc is not None and self._canvas_size == (width, height):
+                return
+            self._drop_canvas()
+            hWndDC = mfcDC = saveDC = saveBitMap = None
+            try:
+                hWndDC = win32gui.GetDC(self.hwnd)
+                mfcDC = win32ui.CreateDCFromHandle(hWndDC)
+                saveDC = mfcDC.CreateCompatibleDC()
+                saveBitMap = win32ui.CreateBitmap()
+                saveBitMap.CreateCompatibleBitmap(mfcDC, width, height)
+                saveDC.SelectObject(saveBitMap)
+            except Exception:
+                self._destroy_gdi(self.hwnd, hWndDC, mfcDC, saveDC, saveBitMap)
+                raise
+            self._canvas_hwnddc = hWndDC
+            self._canvas_mfcdc = mfcDC
+            self._canvas_savedc = saveDC
+            self._canvas_bmp = saveBitMap
+            self._canvas_size = (width, height)
+
+    def _drop_canvas(self) -> None:
+        """释放缓存画布（尺寸变化/捕获异常时调用；进程退出随实例消亡，无需显式调用）。"""
+        with self._canvas_lock:
+            if self._canvas_savedc is None:
+                return
+            bundle = (self._canvas_hwnddc, self._canvas_mfcdc,
+                      self._canvas_savedc, self._canvas_bmp)
+            self._canvas_hwnddc = self._canvas_mfcdc = None
+            self._canvas_savedc = self._canvas_bmp = None
+            self._canvas_size = (0, 0)
+            self._destroy_gdi(self.hwnd, *bundle)
+
     def capture_window_bitblt(self, region: Optional[Tuple[int, int, int, int]] = None) -> Optional[np.ndarray]:
-        """使用BitBlt方法捕获窗口图像，借鉴GitHub代码的完整DC处理流程"""
+        """使用BitBlt方法捕获窗口图像，借鉴GitHub代码的完整DC处理流程
+
+        region=None（整窗客户区，识别循环主路径）走跨帧复用的缓存画布；
+        指定 region 时保持逐帧建毁的旧流程（少见路径，不为它做缓存）。
+        """
         hWndDC = None
         mfcDC = None
         saveDC = None
         saveBitMap = None
+        use_cache = region is None
 
         try:
             # 确保窗口可见
@@ -180,28 +259,41 @@ class WindowCapture:
                 left, top = 0, 0
                 width, height = self.client_width, self.client_height
 
-            # 获取窗口DC
-            hWndDC = win32gui.GetDC(self.hwnd)
-            mfcDC = win32ui.CreateDCFromHandle(hWndDC)
-            saveDC = mfcDC.CreateCompatibleDC()
-            
-            # 创建位图对象
-            saveBitMap = win32ui.CreateBitmap()
-            saveBitMap.CreateCompatibleBitmap(mfcDC, width, height)
-            saveDC.SelectObject(saveBitMap)
+            if use_cache:
+                # 缓存画布：锁内完成 画布获取→BitBlt→读位图，避免并发调用互踩同一画布
+                with self._canvas_lock:
+                    self._get_canvas(width, height)
+                    self._canvas_savedc.BitBlt(
+                        (0, 0),
+                        (width, height),
+                        self._canvas_mfcdc,
+                        (left, top),
+                        win32con.SRCCOPY
+                    )
+                    bmpstr = self._canvas_bmp.GetBitmapBits(True)
+            else:
+                # 获取窗口DC
+                hWndDC = win32gui.GetDC(self.hwnd)
+                mfcDC = win32ui.CreateDCFromHandle(hWndDC)
+                saveDC = mfcDC.CreateCompatibleDC()
 
-            # 使用BitBlt复制图像 - 简化参数以提高兼容性
-            saveDC.BitBlt(
-                (0, 0), 
-                (width, height), 
-                mfcDC, 
-                (left, top), 
-                win32con.SRCCOPY
-            )
+                # 创建位图对象
+                saveBitMap = win32ui.CreateBitmap()
+                saveBitMap.CreateCompatibleBitmap(mfcDC, width, height)
+                saveDC.SelectObject(saveBitMap)
 
-            # 获取位图数据
-            bmpstr = saveBitMap.GetBitmapBits(True)
-            
+                # 使用BitBlt复制图像 - 简化参数以提高兼容性
+                saveDC.BitBlt(
+                    (0, 0),
+                    (width, height),
+                    mfcDC,
+                    (left, top),
+                    win32con.SRCCOPY
+                )
+
+                # 获取位图数据
+                bmpstr = saveBitMap.GetBitmapBits(True)
+
             # 转换为OpenCV图像
             img = np.frombuffer(bmpstr, dtype='uint8').reshape((height, width, 4))
             img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
@@ -213,11 +305,15 @@ class WindowCapture:
 
             return img
         except Exception as e:
+            # 缓存画布异常（窗口销毁/重建等）：丢弃缓存，下次调用重建
+            if use_cache:
+                self._drop_canvas()
             logger.error(f"BitBlt捕获出错: {str(e)}")
             return None
         finally:
-            # 清理资源
-            self._cleanup_resources(hWndDC, mfcDC, saveDC, saveBitMap)
+            # 清理资源（缓存画布成功路径不销毁，留待下帧复用）
+            if not use_cache:
+                self._cleanup_resources(hWndDC, mfcDC, saveDC, saveBitMap)
 
     def capture_window(self, region: Optional[Tuple[int, int, int, int]] = None, capture_mode: Optional[str] = None) -> Optional[np.ndarray]:
         """捕获窗口图像，使用指定的捕获模式
@@ -231,7 +327,6 @@ class WindowCapture:
         """
         # 检查冷却状态：超时自动恢复，避免一次失败后永久返回 None
         if self._capture_cooldown:
-            import time
             if time.time() - self._last_capture_failure >= self._cooldown_duration:
                 self._capture_cooldown = False
             else:
@@ -240,9 +335,8 @@ class WindowCapture:
         # 检查窗口是否最小化
         if self.is_window_minimized():
             logger.error("窗口处于最小化状态，无法捕获图像")
-            
+
             # 记录失败时间戳并进入冷却状态，防止连续弹窗
-            import time
             current_time = time.time()
             if current_time - self._last_capture_failure < self._cooldown_duration:
                 # 距离上次失败时间过短，不再弹窗直接返回None
@@ -277,8 +371,10 @@ class WindowCapture:
                 return None
 
         # 使用指定模式捕获
+        # 两个捕获函数内部都做过黑图判定（全黑返回 None），这里不再对同一帧
+        # 重复做第二次全帧 np.mean 扫描
         img = capture_by_mode(capture_mode)
-        if img is not None and np.mean(img) > 5:
+        if img is not None:
             self.last_shot_shape = img.shape[:2]
             self._capture_cooldown = False
             return img
@@ -287,7 +383,7 @@ class WindowCapture:
         fallback_mode = "BitBlt" if capture_mode == "PrintWindow" else "PrintWindow"
         logger.error(f"{capture_mode}捕获失败，尝试{fallback_mode}方法")
         img = capture_by_mode(fallback_mode)
-        if img is not None and np.mean(img) > 5:
+        if img is not None:
             self.last_shot_shape = img.shape[:2]
             self._capture_cooldown = False
             # 永久切换到 fallback_mode 并更新配置
@@ -300,7 +396,6 @@ class WindowCapture:
         logger.error("所有捕获方法失败")
 
         # 记录失败时间戳并进入冷却状态，防止连续弹窗
-        import time
         current_time = time.time()
         if current_time - self._last_capture_failure < self._cooldown_duration:
             # 距离上次失败时间过短，不再弹窗直接返回None
@@ -318,12 +413,26 @@ class WindowCapture:
         return None
 
     def capture_window_printwindow(self, region: Optional[Tuple[int, int, int, int]] = None) -> Optional[np.ndarray]:
-        """使用PrintWindow方法捕获窗口图像（更好地支持硬件加速窗口）"""
+        """使用PrintWindow方法捕获窗口图像（更好地支持硬件加速窗口）
+
+        region=None（识别循环主路径）走跨帧复用的缓存画布；指定 region 时保持逐帧建毁的旧流程。
+        """
         # 确保资源清理
         hWndDC = None
         mfcDC = None
         saveDC = None
         saveBitMap = None
+        use_cache = region is None
+
+        def _draw(hdc, flag) -> bool:
+            # 使用ctypes的PrintWindow函数或回退到win32gui
+            if PrintWindow:
+                return bool(PrintWindow(self.hwnd, hdc, flag))
+            try:
+                return bool(win32gui.PrintWindow(self.hwnd, hdc, flag))
+            except AttributeError:
+                logger.error("win32gui.PrintWindow不可用")
+                return False
 
         try:
             # 重新获取客户区尺寸
@@ -347,57 +456,54 @@ class WindowCapture:
                 left, top = 0, 0
                 width, height = self.client_width, self.client_height
 
-            # 获取窗口DC
-            hWndDC = win32gui.GetDC(self.hwnd)
-            if not hWndDC:
-                logger.error("获取窗口DC失败")
-                return None
-
-            mfcDC = win32ui.CreateDCFromHandle(hWndDC)
-            if not mfcDC:
-                logger.error("创建MFC DC失败")
-                return None
-
-            try:
-                saveDC = mfcDC.CreateCompatibleDC()
-                if not saveDC:
-                    logger.error("CreateCompatibleDC failed")
-                    return None
-            except Exception as e:
-                logger.error(f"CreateCompatibleDC失败: {str(e)}")
-                return None
-
-            # 创建位图对象
-            saveBitMap = win32ui.CreateBitmap()
-            saveBitMap.CreateCompatibleBitmap(mfcDC, width, height)
-            saveDC.SelectObject(saveBitMap)
-
             # 主用 PW_CLIENTONLY：位图按客户区尺寸创建，必须只渲染客户区，
             # 否则标题栏会占掉顶部、底部游戏内容被挤出截图（MuMu 实测少 47px）。
-            # 使用ctypes的PrintWindow函数或回退到win32gui
-            success = False
-            if PrintWindow:
-                success = PrintWindow(self.hwnd, saveDC.GetSafeHdc(), PW_CLIENTONLY)
+            if use_cache:
+                # 缓存画布：锁内完成 画布获取→PrintWindow→读位图
+                with self._canvas_lock:
+                    self._get_canvas(width, height)
+                    hdc = self._canvas_savedc.GetSafeHdc()
+                    if not _draw(hdc, PW_CLIENTONLY):
+                        logger.error("PrintWindow在PW_CLIENTONLY模式下失败，回退RENDERFULLCONTENT（截图可能含标题栏）")
+                        if not _draw(hdc, PW_RENDERFULLCONTENT):
+                            logger.error("PrintWindow在RENDERFULLCONTENT模式下也失败了")
+                            return None
+                    bmpstr = self._canvas_bmp.GetBitmapBits(True)
             else:
+                # 获取窗口DC
+                hWndDC = win32gui.GetDC(self.hwnd)
+                if not hWndDC:
+                    logger.error("获取窗口DC失败")
+                    return None
+
+                mfcDC = win32ui.CreateDCFromHandle(hWndDC)
+                if not mfcDC:
+                    logger.error("创建MFC DC失败")
+                    return None
+
                 try:
-                    success = win32gui.PrintWindow(self.hwnd, saveDC.GetSafeHdc(), PW_CLIENTONLY)
-                except AttributeError:
-                    logger.error("win32gui.PrintWindow不可用")
+                    saveDC = mfcDC.CreateCompatibleDC()
+                    if not saveDC:
+                        logger.error("CreateCompatibleDC failed")
+                        return None
+                except Exception as e:
+                    logger.error(f"CreateCompatibleDC失败: {str(e)}")
                     return None
 
-            if not success:
-                logger.error("PrintWindow在PW_CLIENTONLY模式下失败，回退RENDERFULLCONTENT（截图可能含标题栏）")
-                if PrintWindow:
-                    success = PrintWindow(self.hwnd, saveDC.GetSafeHdc(), PW_RENDERFULLCONTENT)
-                else:
-                    success = win32gui.PrintWindow(self.hwnd, saveDC.GetSafeHdc(), PW_RENDERFULLCONTENT)
+                # 创建位图对象
+                saveBitMap = win32ui.CreateBitmap()
+                saveBitMap.CreateCompatibleBitmap(mfcDC, width, height)
+                saveDC.SelectObject(saveBitMap)
 
-                if not success:
-                    logger.error("PrintWindow在RENDERFULLCONTENT模式下也失败了")
-                    return None
+                hdc = saveDC.GetSafeHdc()
+                if not _draw(hdc, PW_CLIENTONLY):
+                    logger.error("PrintWindow在PW_CLIENTONLY模式下失败，回退RENDERFULLCONTENT（截图可能含标题栏）")
+                    if not _draw(hdc, PW_RENDERFULLCONTENT):
+                        logger.error("PrintWindow在RENDERFULLCONTENT模式下也失败了")
+                        return None
 
-            # 获取位图数据
-            bmpstr = saveBitMap.GetBitmapBits(True)
+                # 获取位图数据
+                bmpstr = saveBitMap.GetBitmapBits(True)
 
             # 转换为OpenCV图像
             img = np.frombuffer(bmpstr, dtype='uint8').reshape((height, width, 4))
@@ -410,11 +516,15 @@ class WindowCapture:
 
             return img
         except Exception as e:
+            # 缓存画布异常（窗口销毁/重建等）：丢弃缓存，下次调用重建
+            if use_cache:
+                self._drop_canvas()
             logger.error(f"PrintWindow捕获出错: {str(e)}")
             return None
         finally:
-            # 清理资源
-            self._cleanup_resources(hWndDC, mfcDC, saveDC, saveBitMap)
+            # 清理资源（缓存画布成功路径不销毁，留待下帧复用）
+            if not use_cache:
+                self._cleanup_resources(hWndDC, mfcDC, saveDC, saveBitMap)
 
 
     def is_window_minimized(self) -> bool:
@@ -545,7 +655,8 @@ class WindowCapture:
         try:
             # 加载目标图像
             if isinstance(target_image, str):
-                target = cv2.imread(target_image)
+                from OAT.utils.image_io import imread as _imread_safe
+                target = _imread_safe(target_image)
                 if target is None:
                     return None
             else:

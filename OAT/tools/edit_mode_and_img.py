@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import ast
 import shutil
@@ -164,6 +165,10 @@ def _apply_image_file_replace(plan: dict) -> None:
 def _image_paths_to_pipeline_task(name: str, data: dict) -> dict:
     """将 image_paths 格式的配置项转换为 pipeline.tasks 格式"""
     task = {"name": name, "template": data.get("path", name + ".png")}
+    # 显示名（label）：纯展示用，往返必须保留，否则编辑器里「图像名称」会退回文件名
+    _label = str(data.get("label") or "").strip()
+    if _label:
+        task["label"] = _label
 
     # 点击后随机等待（每张图独立，留空则运行时按默认 0.8~5）
     _cw_min = _normalize_wait(data.get("click_wait_min"))
@@ -299,6 +304,18 @@ def _image_paths_to_pipeline_task(name: str, data: dict) -> dict:
         except (ValueError, TypeError):
             pass
 
+    # 停止点击（出现图片停止）：往返保留，字段名与 image_paths 侧一致
+    if data.get("stop_click_enabled"):
+        task["stop_click_enabled"] = True
+        _si = data.get("stop_images")
+        if isinstance(_si, list) and _si:
+            task["stop_images"] = list(_si)
+        if data.get("stop_time") is not None:
+            try:
+                task["stop_time"] = float(data["stop_time"])
+            except (ValueError, TypeError):
+                pass
+
     return task
 
 
@@ -306,6 +323,8 @@ def _pipeline_task_to_image_paths(task: dict) -> dict:
     """将 pipeline.tasks 格式转换为 image_paths 格式（用于旧版编辑器）"""
     data = {
         "path": task.get("template", task.get("name", "") + ".png"),
+        # 显示名（label）：往返保留，编辑器「图像名称」直接显示它
+        "label": task.get("label", ""),
         "is_challenge_start": bool(task.get("is_start", False)),
         "message": task.get("message", ""),
         "is_global": bool(task.get("is_global", False)),
@@ -406,6 +425,17 @@ def _pipeline_task_to_image_paths(task: dict) -> dict:
         if "click_type" not in data:
             data["click_type"] = "image"
 
+    # 停止点击（出现图片停止）：往返保留
+    if task.get("stop_click_enabled"):
+        data["stop_click_enabled"] = True
+        _si = task.get("stop_images")
+        if isinstance(_si, list) and _si:
+            data["stop_images"] = list(_si)
+        try:
+            data["stop_time"] = float(task.get("stop_time", 5.0))
+        except (ValueError, TypeError):
+            data["stop_time"] = 5.0
+
     return data
 
 
@@ -417,6 +447,8 @@ _IMAGE_CLIPBOARD = {
     "image_bytes": b"",
     "config": {},
     "source_mode_dir": "",
+    # 停止条件图字节快照：{相对路径: bytes}，粘贴时随配置一起落地
+    "stop_files": {},
 }
 
 
@@ -493,13 +525,23 @@ def _insert_pasted_image(config: dict, new_key: str, cfg: dict) -> None:
 
 
 class ImageConfigDialog(QDialog):
-    def __init__(self, parent=None, image_name="", config_data={}, config_path="", image_list=[]):
+    def __init__(self, parent=None, image_name="", config_data={}, config_path="", image_list=[],
+                 display_name=""):
+        """display_name：图像「名称」= 列表里显示的那行文字（config 的 label 字段）。
+
+        名称与后端解耦：改它只写 label（纯显示），配置键/template/path/文件名
+        一律由磁盘文件名派生，不会跟着变；路径（文件名）也保持 ASCII 不被 OCR 命名。
+        """
         super().__init__(parent)
         self.setWindowTitle("图像配置")
         self.resize(500, 460)
 
         self.image_name = image_name
         self.config_data = config_data
+        # 名称默认取配置里的 label（= 列表里显示的同一份文字），没有才退回文件名
+        self.display_name = (display_name
+                             or str(self.config_data.get("label") or "").strip()
+                             or image_name)
         self.config_path = config_path
         self.image_list = image_list
         # 待替换的新图绝对路径（浏览选择后设置，保存时复制到模式目录）
@@ -511,6 +553,12 @@ class ImageConfigDialog(QDialog):
         # 初始化UI
         self.setup_ui()
         self._refresh_preview()
+        # 新增图片配置时：自动识别图片上的文字，填进「OCR识别文本」。
+        # 只在配置里还没带 ocr_target_text 时识别（编辑旧配置、截图添加已预填的不重复跑）；
+        # 文本框非空时 _autofill_ocr_from_image 也不会覆盖手填内容。
+        if "ocr_target_text" not in self.config_data and self.config_path:
+            image_path = os.path.join(os.path.dirname(self.config_path), self.image_name)
+            self._autofill_ocr_from_image(image_path)
     
     def setup_ui(self):
         """
@@ -521,7 +569,7 @@ class ImageConfigDialog(QDialog):
         # 图像名称
         name_layout = QHBoxLayout()
         name_label = QLabel("图像名称:")
-        self.name_line_edit = QLineEdit(self.image_name)
+        self.name_line_edit = QLineEdit(self.display_name)
         name_layout.addWidget(name_label)
         name_layout.addWidget(self.name_line_edit)
         main_layout.addLayout(name_layout)
@@ -679,14 +727,63 @@ class ImageConfigDialog(QDialog):
         click_area_layout.addLayout(click_wait_layout)
 
         main_layout.addWidget(click_area_group)
+
+        # 停止点击设置：勾选后，点击该图之前先识别停止条件图；
+        # 任一条件图出现在画面上就本轮不点击，并按「停止时间」等待后进入下一轮。
+        stop_group = QtWidgets.QGroupBox("停止点击设置")
+        stop_layout = QtWidgets.QVBoxLayout(stop_group)
+
+        self.stop_click_checkbox = QtWidgets.QCheckBox("出现图片停止点击")
+        self.stop_click_checkbox.setChecked(bool(self.config_data.get("stop_click_enabled", False)))
+        self.stop_click_checkbox.setToolTip("勾选后，点击该图之前先识别下方条件图；命中任一张则本轮不点击")
+        stop_layout.addWidget(self.stop_click_checkbox)
+
+        # 条件图片槽位（默认 3 个）：点 + 号进入截图添加模式，截图后自动随机命名，
+        # 槽位里只显示缩略图不显示文件名；已添加时点击=重新截图，右键=清除
+        self.stop_slots = [p for p in (self.config_data.get("stop_images") or []) if p][:3]
+        while len(self.stop_slots) < 3:
+            self.stop_slots.append(None)
+        self.stop_slot_buttons = []
+        stop_slots_layout = QtWidgets.QHBoxLayout()
+        for _i in range(3):
+            _btn = QtWidgets.QPushButton()
+            _btn.setFixedSize(84, 84)
+            _btn.setIconSize(QtCore.QSize(72, 72))
+            _btn.setText("+")
+            _btn.setToolTip("点击 + 截图添加停止条件图；已添加时点击重新截图，右键清除")
+            _btn.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+            _btn.clicked.connect(lambda _checked=False, idx=_i: self._capture_stop_image(idx))
+            _btn.customContextMenuRequested.connect(lambda _pos, idx=_i: self._stop_slot_menu(idx))
+            self.stop_slot_buttons.append(_btn)
+            stop_slots_layout.addWidget(_btn)
+        stop_slots_layout.addStretch()
+        stop_layout.addLayout(stop_slots_layout)
+
+        # 停止时间（秒）：命中停止条件后本轮不点击并等待此时长，默认 5
+        stop_time_layout = QtWidgets.QHBoxLayout()
+        stop_time_layout.addWidget(QLabel("停止时间(秒):"))
+        _saved_stop_time = self.config_data.get("stop_time")
+        self.stop_time_edit = QtWidgets.QLineEdit(
+            str(_saved_stop_time if _saved_stop_time is not None else 5))
+        self.stop_time_edit.setFixedWidth(60)
+        stop_time_layout.addWidget(self.stop_time_edit)
+        stop_time_layout.addWidget(QLabel("命中停止条件后等待的秒数（默认 5）"))
+        stop_time_layout.addStretch()
+        stop_layout.addLayout(stop_time_layout)
+
+        main_layout.addWidget(stop_group)
+
+        # 勾选状态驱动槽位/时间框可用性；打开对话框时按已有配置刷新缩略图
+        self.stop_click_checkbox.toggled.connect(self._on_stop_toggle)
+        self._on_stop_toggle(self.stop_click_checkbox.isChecked())
         
         # OCR配置
         ocr_group = QtWidgets.QGroupBox("OCR配置")
         ocr_layout = QVBoxLayout(ocr_group)
         
-        # 是否启用OCR
+        # 是否启用OCR（默认勾选；旧配置里存过 False 的仍按存的值显示）
         self.is_ocr_enabled_checkbox = QtWidgets.QCheckBox("是否启用OCR")
-        self.is_ocr_enabled_checkbox.setChecked(self.config_data.get("ocr_enabled", False))
+        self.is_ocr_enabled_checkbox.setChecked(self.config_data.get("ocr_enabled", True))
         ocr_layout.addWidget(self.is_ocr_enabled_checkbox)
         
         # OCR识别文本
@@ -816,9 +913,11 @@ class ImageConfigDialog(QDialog):
             logger.info(f"自动识别文字：{os.path.basename(image_path)} 上没认到文字，请手动填写")
             return
 
-        # 取置信度最高的一条作为主文字；多条时把全部候选写进日志备查
-        best = max(items, key=lambda d: d.get('confidence', 0.0))
-        text = (best.get('text') or '').strip()
+        # 主文字选法：能把「同一按钮的多行文字」拼成完整文案就拼（『召唤』+『鬼王』
+# →『召唤鬼王』），框太散/太长才退回第一行（见 _compose_autofill_text）。
+        text = ModeEditorDialog._compose_autofill_text(items)
+        best = next((d for d in items if (d.get('text') or '').strip() == text), None) \
+            or max(items, key=lambda d: d.get('confidence', 0.0))
         if not text:
             return
         self.ocr_text_edit.setText(text)
@@ -829,7 +928,7 @@ class ImageConfigDialog(QDialog):
                               for d in items if d is not best)
             logger.info(f"  图上其余文字（未采用）：{others}")
             self.ocr_text_edit.setToolTip(
-                f"图上识别到 {len(items)} 处文字，已自动填入置信度最高的一条：{text}\n"
+                f"图上识别到 {len(items)} 处文字，已自动填入：{text}\n"
                 f"其余候选：{others}\n如填错了请手动改。")
 
     def _preview_candidate_paths(self):
@@ -990,21 +1089,156 @@ class ImageConfigDialog(QDialog):
         except Exception:
             pass
 
+    # ---------- 停止点击设置（出现图片停止） ----------
+
+    def _stop_dir(self) -> str:
+        """停止条件图的存放目录：模式目录下的 stop/ 子目录。
+
+        放子目录而不是模式根目录，是因为图片列表是扫根目录建的，
+        放根目录会让停止图混进普通模板图列表里。
+        """
+        return os.path.join(os.path.dirname(self.config_path), 'stop') if self.config_path else ""
+
+    def _on_stop_toggle(self, checked: bool):
+        """勾选状态驱动槽位与停止时间框的可用性，并刷新缩略图"""
+        for _btn in self.stop_slot_buttons:
+            _btn.setEnabled(checked)
+        self.stop_time_edit.setEnabled(checked)
+        if checked:
+            for _i in range(3):
+                self._refresh_stop_slot(_i)
+
+    def _refresh_stop_slot(self, idx: int):
+        """刷新槽位显示：有图显示缩略图，无图显示 + 号（不显示文件名）"""
+        btn = self.stop_slot_buttons[idx]
+        rel = self.stop_slots[idx]
+        if rel:
+            p = os.path.join(os.path.dirname(self.config_path), rel)
+            pix = QtGui.QPixmap(p)
+            if not pix.isNull():
+                btn.setIcon(QtGui.QIcon(pix))
+                btn.setText("")
+                btn.setToolTip(f"点击重新截图替换；右键清除\n{rel}")
+                return
+            # 配置里有引用但文件丢了：按空槽处理，保存时这条引用会被剔掉
+            self.stop_slots[idx] = None
+        btn.setIcon(QtGui.QIcon())
+        btn.setText("+")
+        btn.setToolTip("点击 + 截图添加停止条件图；已添加时点击重新截图，右键清除")
+
+    def _capture_stop_image(self, idx: int):
+        """点击槽位：进入截图添加模式，框选后自动随机命名存入 stop/ 目录"""
+        if not self.stop_click_checkbox.isChecked():
+            self.stop_click_checkbox.setChecked(True)
+            return
+        try:
+            from OAT.tools.region_capture import capture_region_from_window, save_crop
+        except Exception as e:
+            QMessageBox.warning(self, "警告", f"截图工具不可用: {e}")
+            return
+        hwnd, title = self._current_game_window()
+        crop, _crop_rect, _size = capture_region_from_window(
+            self, hwnd=hwnd, window_title=title)
+        if crop is None:
+            return
+        stop_dir = self._stop_dir()
+        if not stop_dir:
+            QMessageBox.warning(self, "警告", "无法确定模式目录，无法保存停止条件图")
+            return
+        try:
+            os.makedirs(stop_dir, exist_ok=True)
+        except Exception as e:
+            QMessageBox.warning(self, "警告", f"创建停止图目录失败: {e}")
+            return
+
+        # 自动随机命名（时间戳），重名自动加序号
+        base = "stop_" + time.strftime("%Y%m%d-%H%M%S")
+        filename = base + ".png"
+        n = 1
+        while os.path.exists(os.path.join(stop_dir, filename)):
+            filename = f"{base}_{n}.png"
+            n += 1
+        dest = os.path.join(stop_dir, filename)
+        if not save_crop(crop, dest):
+            QMessageBox.warning(self, "警告", f"保存截图失败: {dest}")
+            return
+
+        # 覆盖语义：该槽位已有图就删旧文件，避免孤儿文件堆积
+        old_rel = self.stop_slots[idx]
+        if old_rel:
+            try:
+                old_abs = os.path.join(os.path.dirname(self.config_path), old_rel)
+                if os.path.exists(old_abs):
+                    os.remove(old_abs)
+            except Exception as e:
+                logger.warning(f"删除旧停止图失败（忽略）: {e}")
+        self.stop_slots[idx] = f"stop/{filename}"
+        self._refresh_stop_slot(idx)
+        logger.info(f"停止条件图已添加: stop/{filename}（槽位 {idx + 1}/3）")
+
+    def _stop_slot_menu(self, idx: int):
+        """槽位右键菜单：重新截图 / 清除"""
+        if not self.stop_slots[idx]:
+            return
+        menu = QtWidgets.QMenu(self)
+        recapture_action = menu.addAction("重新截图")
+        clear_action = menu.addAction("清除")
+        btn = self.stop_slot_buttons[idx]
+        chosen = menu.exec(btn.mapToGlobal(QtCore.QPoint(0, btn.height())))
+        if chosen == recapture_action:
+            self._capture_stop_image(idx)
+        elif chosen == clear_action:
+            self._clear_stop_slot(idx)
+
+    def _clear_stop_slot(self, idx: int):
+        """清除槽位：删文件 + 清引用，不留孤儿"""
+        rel = self.stop_slots[idx]
+        if rel:
+            try:
+                p = os.path.join(os.path.dirname(self.config_path), rel)
+                if os.path.exists(p):
+                    os.remove(p)
+            except Exception as e:
+                logger.warning(f"删除停止图失败（忽略）: {e}")
+        self.stop_slots[idx] = None
+        self._refresh_stop_slot(idx)
+
+    def _discard_stop_files(self):
+        """取消勾选后保存成功时调用：删除全部槽位引用的停止图文件"""
+        mode_dir = os.path.dirname(self.config_path) if self.config_path else ""
+        for rel in self.stop_slots:
+            if not rel or not mode_dir:
+                continue
+            try:
+                p = os.path.join(mode_dir, rel)
+                if os.path.exists(p):
+                    os.remove(p)
+            except Exception as e:
+                logger.warning(f"删除停止图失败（忽略）: {e}")
+        self.stop_slots = [None, None, None]
+        for _i in range(3):
+            self._refresh_stop_slot(_i)
+
     def save(self):
         """
         保存配置（含图片替换：复制到模式目录并按改后名字落地）
         """
-        # 更新配置数据（目标文件名按改后名字规范化，后缀缺失时继承）
-        raw_new_name = self.name_line_edit.text()
-        new_name = _normalize_dest_filename(raw_new_name, self.pending_image_source, self.image_name)
-        if not new_name:
+        # 更新配置数据
+        # 名称只是「显示名」(label)：改了它不会动配置键、文件名、template；
+        # 后端身份始终由路径（文件名）派生，避免界面上改个字就把配置结构改了。
+        raw_new_name = self.name_line_edit.text().strip()
+        if not raw_new_name:
             QMessageBox.warning(self, "警告", "图像名称不能为空")
             return
-        # 回写规范化后的名字，避免无后缀导致文件与配置不一致
-        if new_name != raw_new_name.strip():
-            self.name_line_edit.setText(new_name)
-        self.path_line_edit.setText(new_name)
-        self.config_data["path"] = new_name
+
+        # 目标文件名：以路径框为准（待替换新图时按新图后缀规范化）
+        path_name = _normalize_dest_filename(
+            self.path_line_edit.text().strip() or self.image_name,
+            self.pending_image_source, self.image_name)
+        new_name = path_name                       # 文件操作仍用文件名
+        self.path_line_edit.setText(path_name)
+        self.config_data["path"] = path_name
+        self.config_data["label"] = raw_new_name   # 仅显示用
         self.config_data["is_challenge_start"] = self.is_challenge_start_checkbox.isChecked()
         self.config_data["message"] = self.message_line_edit.text()
         self.config_data["is_global"] = self.is_global_checkbox.isChecked()
@@ -1044,6 +1278,30 @@ class ImageConfigDialog(QDialog):
                 _cw_min, _cw_max = _cw_max, _cw_min
             self.config_data["click_wait_min"] = _cw_min
             self.config_data["click_wait_max"] = _cw_max
+
+        # 停止点击设置（出现图片停止）：勾选时写入条件图与停止时间；
+        # 未勾选时只清配置字段（引用的文件等保存成功后再物理删除，见 save 尾部）
+        if self.stop_click_checkbox.isChecked():
+            _stop_imgs = [p for p in self.stop_slots if p]
+            if not _stop_imgs:
+                QMessageBox.warning(self, "警告", "已勾选停止点击，请至少为 1 个方框截图添加条件图片")
+                return
+            _stop_raw = self.stop_time_edit.text().strip()
+            try:
+                _stop_time = float(_stop_raw) if _stop_raw else 5.0
+            except (ValueError, TypeError):
+                QMessageBox.warning(self, "警告", "停止时间格式非法，应为数字（单位秒）")
+                return
+            if _stop_time < 0:
+                QMessageBox.warning(self, "警告", "停止时间不能为负数")
+                return
+            self.config_data["stop_click_enabled"] = True
+            self.config_data["stop_images"] = _stop_imgs
+            self.config_data["stop_time"] = _stop_time
+        else:
+            self.config_data.pop("stop_click_enabled", None)
+            self.config_data.pop("stop_images", None)
+            self.config_data.pop("stop_time", None)
 
         if action_type == "wait":
             try:
@@ -1201,7 +1459,7 @@ class ImageConfigDialog(QDialog):
                 old_image_key = os.path.splitext(self.image_name)[0]
 
                 # 获取新的图像键名（去除扩展名）
-                new_image_key = os.path.splitext(new_name)[0]
+                new_image_key = os.path.splitext(new_name)[0]   # 键 = 文件名主干（后端身份只看文件）
 
                 # 如果名称改变，需要删除旧的配置并添加新的
                 if new_image_key != old_image_key:
@@ -1254,6 +1512,9 @@ class ImageConfigDialog(QDialog):
                     QMessageBox.information(self, "成功", f"图片已替换为 {new_name}，配置保存成功")
                 else:
                     QMessageBox.information(self, "成功", "配置保存成功")
+                # 保存成功后再物理删除停止图文件：写盘失败时保留，用户可重试不丢图
+                if not self.stop_click_checkbox.isChecked():
+                    self._discard_stop_files()
                 self.accept()
             except Exception as e:
                 QMessageBox.warning(self, "警告", f"保存配置失败: {e}")
@@ -1556,39 +1817,204 @@ class ModeEditorDialog(QDialog):
                         logger.error(f"加载配置文件失败: {e}")
                 
                 # 加载图像
+                # 列表里显示「名称」(label，如 OCR 文字)，但条目数据里存真实文件名——
+                # 显示与后端解耦：改显示名不会动配置键/文件名，所有后续操作都用文件名。
+                label_map = {}
+                for _key, _entry in (config_data.get("image_paths") or {}).items():
+                    if isinstance(_entry, dict):
+                        _p = _entry.get("path")
+                        if isinstance(_p, str) and _p:
+                            _lab = str(_entry.get("label") or "").strip()
+                            if _lab:
+                                label_map[_p.lower()] = _lab
+                for t in ((config_data.get("pipeline") or {}).get("tasks") or []):
+                    if isinstance(t, dict):
+                        _p = t.get("template")
+                        if isinstance(_p, str) and _p and _p.lower() not in label_map:
+                            _lab = str(t.get("label") or "").strip()
+                            if _lab:
+                                label_map[_p.lower()] = _lab
+
                 for file in os.listdir(mode_dir):
                     if file.endswith(('.png', '.jpg', '.jpeg', '.bmp')):
                         item = QListWidgetItem()
-                        item.setText(file)
-                        
+                        item.setText(label_map.get(file.lower(), file))
+                        item.setData(QtCore.Qt.ItemDataRole.UserRole, file)
+
                         # 加载图像预览
                         img_path = os.path.join(mode_dir, file)
                         pixmap = QPixmap(img_path)
                         if not pixmap.isNull():
                             pixmap = pixmap.scaled(100, 100, QtCore.Qt.AspectRatioMode.KeepAspectRatio)
                             item.setIcon(QtGui.QIcon(pixmap))
-                        
+
                         self.img_list.addItem(item)
+
+    @staticmethod
+    def _item_file(item) -> str:
+        """列表条目的真实文件名（显示文本可能是 label，不能当文件名用）。"""
+        if item is None:
+            return ""
+        try:
+            data = item.data(QtCore.Qt.ItemDataRole.UserRole)
+        except Exception:
+            data = None
+        return data or (item.text() if item is not None else "")
     
+    def _auto_dir_name(self, hint: str, fallback: str = "mode") -> str:
+        """自动生成目录名：优先用 hint 里可用的英文字符，重名自动加序号。
+
+        为什么不再让用户填：目录名只影响 source/ 下的落盘位置，用户看不到也用不到；
+        手动输入既要校验英文、又要防重名，纯属负担。这里统一自动生成：
+          - 名称本身是英文/数字/下划线 → 直接用（如 "PVE"、"pve2"）；
+          - 含中文等非法字符 → 退化成 fallback / 父目录名 + 序号（如 "PVE_2"）；
+          - 与已有目录或已配置目录重名 → 追加 _2/_3… 直到唯一。
+        """
+        used = set()
+        for v in self.temp_mode_config.values():
+            if isinstance(v, dict):
+                used.update(str(x) for x in v.values())
+            else:
+                used.add(str(v))
+        try:
+            used.update(os.listdir(self.source_dir))
+        except Exception:
+            pass
+        # Windows 目录名大小写不敏感：PVE 与 pve 是同一个目录，必须按小写比较，
+        # 否则会"生成"一个与现有目录同名（不同大小写）的"新"目录。
+        used = {s.lower() for s in used}
+
+        base = str(hint or '')
+        base = re.sub(r'\s+', '_', base)                  # 空格转下划线
+        base = re.sub(r'[^A-Za-z0-9_]', '', base)         # 去掉中文等非法字符
+        base = re.sub(r'_+', '_', base).strip('_')
+        if not base or base.isdigit():
+            base = fallback                               # 纯数字/中文名 → 通用名 + 序号
+        base = base.lower()                               # 与现有 pve/dz/sf 风格统一
+
+        if base not in used:
+            return base
+        n = 2
+        while f"{base}_{n}" in used:
+            n += 1
+        return f"{base}_{n}"
+
+    def _sanitize_image_stem(self, text: str, max_len: int = 24) -> str:
+        """把 OCR 文字变成可用的文件名主干：留中英文/数字/_-，其余丢掉。
+
+        用于「图片配置命名自动用识别到的 OCR 文字」——按钮文字常见中文，
+        所以这里保留 CJK；长度截断避免一长串句子当文件名。
+        """
+        s = str(text or '').strip()
+        if not s:
+            return ''
+        s = re.sub(r'\s+', '_', s)
+        s = re.sub(r'[^0-9A-Za-z_\u4e00-\u9fff\-]', '', s)
+        s = re.sub(r'_+', '_', s).strip('_.-')
+        if len(s) > max_len:
+            s = s[:max_len].strip('_.-')
+        return s
+
+    def _unique_image_name(self, stem: str, mode_dir: str, ext: str = ".png",
+                           fallback: str = "") -> str:
+        """在目标目录内取唯一文件名：<stem><ext>，重名依次加 _2/_3。
+
+        stem 为空（没认到文字）时用 fallback（如 shot_时间戳），
+        fallback 也为空才用 img_时间戳——保证永远能落盘。
+        """
+        existing = set()
+        try:
+            existing = {n.lower() for n in os.listdir(mode_dir)}
+        except Exception:
+            pass
+        stem = (stem or fallback or ("img_" + time.strftime("%Y%m%d-%H%M%S"))).strip()
+        ext = ext if ext.startswith('.') else f".{ext}"
+        name = f"{stem}{ext}"
+        n = 2
+        while name.lower() in existing:
+            name = f"{stem}_{n}{ext}"
+            n += 1
+        return name
+
+    def _rename_image_key_in_config(self, mode_dir: str, old_key: str, new_key: str,
+                                    update_filenames: bool = True) -> bool:
+        """把 config.json 里的图片键 old_key 改成 new_key，并重写所有引用。
+
+        update_filenames=True（真改名：文件也跟着改）时才同步 path/template；
+        名称与文件名解耦的场景（名称用 OCR 文字、文件仍是 shot_xxx.png）传 False，
+        这样只改配置键，不碰磁盘文件名。
+
+        需要同步的东西：
+          - image_paths: 键改名（+ 可选 path 文件名同步）
+          - 其它条目的 next_image 指向旧键 → 改新键
+          - pipeline.tasks: name 改名（+ 可选 template 文件名同步）；
+            其余任务 next 指向旧键 → 改新键
+        """
+        cfg_path = os.path.join(mode_dir, 'config.json')
+        if not os.path.exists(cfg_path) or old_key == new_key:
+            return old_key == new_key
+        old_ext = old_key  # 兼容下面用旧键推文件名
+        try:
+            with open(cfg_path, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+        except Exception as e:
+            logger.warning(f"图片改名：读取配置失败 {cfg_path}: {e}")
+            return False
+
+        ip = config.get('image_paths')
+        if isinstance(ip, dict):
+            entry = ip.pop(old_key, None)
+            if entry is not None:
+                ip[new_key] = entry
+            for k, v in ip.items():
+                if not isinstance(v, dict):
+                    continue
+                # 指向旧键的引用
+                if v.get('next_image') == old_key:
+                    v['next_image'] = new_key
+                # 文件名字段：同名条目里 path 仍是旧文件名时按新键改
+                p = v.get('path')
+                if (update_filenames and isinstance(p, str)
+                        and os.path.splitext(p)[0] == old_ext):
+                    v['path'] = new_key + (os.path.splitext(p)[1] or ".png")
+
+        pipe = config.get('pipeline')
+        if isinstance(pipe, dict) and isinstance(pipe.get('tasks'), list):
+            for t in pipe['tasks']:
+                if not isinstance(t, dict):
+                    continue
+                if t.get('name') == old_key:
+                    t['name'] = new_key
+                elif t.get('next') == old_key:
+                    t['next'] = new_key
+                tpl = t.get('template')
+                if (update_filenames and isinstance(tpl, str)
+                        and os.path.splitext(tpl)[0] == old_ext):
+                    t['template'] = new_key + (os.path.splitext(tpl)[1] or ".png")
+
+        try:
+            with open(cfg_path, 'w', encoding='utf-8') as f:
+                json.dump(config, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.warning(f"图片改名：写配置失败 {cfg_path}: {e}")
+            return False
+        return True
+
     def add_mode(self):
         """
         添加新模式
         """
-        # 弹出输入对话框获取模式名称
+        # 弹出输入对话框获取模式名称（只有显示名需要手填，目录名自动生成）
         mode_name, ok = QtWidgets.QInputDialog.getText(self, "添加模式", "请输入模式名称:")
         if not (ok and mode_name):
             return
-        
-        # 弹出输入对话框获取模式目录名称
-        dir_name, ok = QtWidgets.QInputDialog.getText(self, "添加模式", "请输入模式目录名称(请使用英文命名):")
-        if not (ok and dir_name):
+        mode_name = mode_name.strip()
+        if not mode_name:
             return
-        
-        # 检查目录名称是否为英文
-        if not dir_name.isascii() or not dir_name.replace('_', '').isalnum():
-            QMessageBox.warning(self, "警告", "目录名称必须使用英文、数字或下划线")
-            return
-        
+
+        dir_name = self._auto_dir_name(mode_name, fallback="mode")
+        logger.info(f"添加模式：{mode_name} → 目录自动命名为 {dir_name}")
+
         if mode_name not in self.temp_mode_config:
             self.temp_mode_config[mode_name] = dir_name
             self.load_mode_tree()
@@ -1604,22 +2030,23 @@ class ModeEditorDialog(QDialog):
             QMessageBox.warning(self, "警告", "请先选择一个顶级模式")
             return
         
-        # 弹出输入对话框获取子模式名称
+        # 弹出输入对话框获取子模式名称（只有显示名需要手填，目录名自动生成）
         submode_name, ok = QtWidgets.QInputDialog.getText(self, "添加子模式", "请输入子模式名称:")
         if not (ok and submode_name):
             return
-        
-        # 弹出输入对话框获取子模式目录名称
-        submode_dir, ok = QtWidgets.QInputDialog.getText(self, "添加子模式", "请输入子模式目录名称(请使用英文命名):")
-        if not (ok and submode_dir):
+        submode_name = submode_name.strip()
+        if not submode_name:
             return
-        
-        # 检查目录名称是否为英文
-        if not submode_dir.isascii() or not submode_dir.replace('_', '').isalnum():
-            QMessageBox.warning(self, "警告", "目录名称必须使用英文、数字或下划线")
-            return
-        
+
         mode_name = current_item.text(0)
+
+        # 自动目录名：提示词 = 父目录名 + 子模式名（中文名会被过滤，退化成父目录 + 序号，
+        # 例如 PVE 下新增中文子模式 → pve_2），重名自动加后缀，全程不需要用户输入。
+        _parent = self.temp_mode_config.get(mode_name)
+        if isinstance(_parent, dict):
+            _parent = next(iter(_parent.values()), "")
+        submode_dir = self._auto_dir_name(f"{_parent}_{submode_name}", fallback="sub")
+        logger.info(f"添加子模式：{mode_name} / {submode_name} → 目录自动命名为 {submode_dir}")
         
         # 如果模式数据不是字典，转换为字典
         if not isinstance(self.temp_mode_config[mode_name], dict):
@@ -1764,54 +2191,56 @@ class ModeEditorDialog(QDialog):
                 if not os.path.exists(mode_dir):
                     os.makedirs(mode_dir)
                 
-                # 复制文件
+                # 先规划：磁盘文件名保持 ASCII（原文件名/时间戳），OCR 文字只作为「显示名称」。
+                # 中文文件名会在 OpenCV 等环节带来编码坑，而名称只是配置键/显示名，
+                # 二者解耦后既好认又不踩雷。
+                plan = []          # [(源文件, 目标文件名, 显示名)]
                 for file in files:
-                    filename = os.path.basename(file)
-                    dest_path = os.path.join(mode_dir, filename)
-                    if not os.path.exists(dest_path):
-                        try:
-                            shutil.copy(file, dest_path)
-                        except Exception as e:
-                            QMessageBox.warning(self, "警告", f"复制文件失败: {e}")
-                    else:
-                        QMessageBox.warning(self, "警告", f"文件 {filename} 已存在")
-                
+                    ext = os.path.splitext(file)[1].lower() or ".png"
+                    try:
+                        ocr_text, _ = self._detect_text_on_crop_path(file)
+                    except Exception:
+                        ocr_text = ""
+                    base = os.path.splitext(os.path.basename(file))[0]
+                    if not base.isascii():
+                        base = "shot_" + time.strftime("%Y%m%d-%H%M%S")
+                    name_on_disk = self._unique_image_name("", mode_dir, ext, fallback=base)
+                    plan.append((file, name_on_disk, ocr_text or ""))
+
+                # 复制文件（目标名已保证不重名）
+                for src, name, _disp in plan:
+                    dest_path = os.path.join(mode_dir, name)
+                    try:
+                        shutil.copy(src, dest_path)
+                    except Exception as e:
+                        QMessageBox.warning(self, "警告", f"复制文件失败: {e}")
+
                 # 构建配置文件路径
                 config_path = os.path.join(mode_dir, 'config.json')
-                
+
                 # 重新加载图像
                 self.load_images(mode_path)
-                
+
                 # 弹出图像配置对话框
-                for file in files:
-                    filename = os.path.basename(file)
+                for src, filename, disp in plan:
                     # 查找新添加的图像项
                     for i in range(self.img_list.count()):
                         item = self.img_list.item(i)
-                        if item.text() == filename:
+                        if self._item_file(item) == filename:
                             # 选择该图像
                             self.img_list.setCurrentItem(item)
                             # 获取当前模式的所有图像名称
                             image_list = []
                             for i in range(self.img_list.count()):
                                 item = self.img_list.item(i)
-                                image_list.append(item.text())
-                            
-                            # 打开配置对话框
-                            dialog = ImageConfigDialog(self, filename, {}, config_path, image_list)
+                                image_list.append(self._item_file(item))
+
+                            # 打开配置对话框：名称预填 OCR 文字（显示名），路径仍是文件名
+                            dialog = ImageConfigDialog(
+                                self, filename, {}, config_path, image_list,
+                                display_name=disp)
                             if dialog.exec() == QDialog.DialogCode.Accepted:
-                                # 检查是否需要重命名文件
-                                new_name = dialog.name_line_edit.text()
-                                if new_name != filename:
-                                    # 构建旧文件和新文件的路径
-                                    old_path = os.path.join(mode_dir, filename)
-                                    new_path = os.path.join(mode_dir, new_name)
-                                    # 重命名文件
-                                    try:
-                                        os.rename(old_path, new_path)
-                                    except Exception as e:
-                                        QMessageBox.warning(self, "警告", f"重命名文件失败: {e}")
-                                # 重新加载图像
+                                # 名称只影响配置键，不改磁盘文件名
                                 self.load_images(mode_path)
                             break
             else:
@@ -1849,19 +2278,6 @@ class ModeEditorDialog(QDialog):
         if crop is None:
             return
 
-        # 生成不重名的文件名
-        base = "shot_" + time.strftime("%Y%m%d-%H%M%S")
-        filename = base + ".png"
-        n = 1
-        while os.path.exists(os.path.join(mode_dir, filename)):
-            filename = f"{base}_{n}.png"
-            n += 1
-        dest_path = os.path.join(mode_dir, filename)
-
-        if not save_crop(crop, dest_path):
-            QMessageBox.warning(self, "警告", f"保存截图失败: {dest_path}")
-            return
-
         w, h = crop.shape[1], crop.shape[0]
         cap = capture_size or (0, 0)
 
@@ -1873,6 +2289,17 @@ class ModeEditorDialog(QDialog):
         if ocr_text:
             initial_cfg["ocr_target_text"] = ocr_text
             initial_cfg["ocr_enabled"] = True
+
+        # 文件名固定用 ASCII 时间戳（路径不按 OCR 命名）：中文文件名在 OpenCV 等
+        # 环节有编码坑；识别到的文字只作为「图像名称」（配置键/显示名）。
+        filename = self._unique_image_name(
+            "", mode_dir, ".png",
+            fallback="shot_" + time.strftime("%Y%m%d-%H%M%S"))
+        dest_path = os.path.join(mode_dir, filename)
+
+        if not save_crop(crop, dest_path):
+            QMessageBox.warning(self, "警告", f"保存截图失败: {dest_path}")
+            return
 
         # 框选位置 (x, y, w, h) 就是客户区坐标，和识别/点击用的是同一套坐标系，
         # 所以可以直接换算成配置里的区域格式 [x1, x2, y1, y2] 预填进去，
@@ -1907,21 +2334,16 @@ class ModeEditorDialog(QDialog):
         config_path = os.path.join(mode_dir, 'config.json')
         for i in range(self.img_list.count()):
             item = self.img_list.item(i)
-            if item.text() == filename:
+            if self._item_file(item) == filename:
                 self.img_list.setCurrentItem(item)
                 break
 
         image_list = [self.img_list.item(i).text() for i in range(self.img_list.count())]
-        # 把记录下来的位置作为初始配置带进对话框（用户可直接看到/修改）
-        cfg = ImageConfigDialog(self, filename, initial_cfg, config_path, image_list)
+        # 把记录下来的位置作为初始配置带进对话框；名称预填 OCR 文字（仅显示名）
+        cfg = ImageConfigDialog(self, filename, initial_cfg, config_path, image_list,
+                                display_name=self._sanitize_image_stem(ocr_text) if ocr_text else "")
         if cfg.exec() == QDialog.DialogCode.Accepted:
-            new_name = cfg.name_line_edit.text()
-            if new_name and new_name != filename:
-                try:
-                    os.rename(os.path.join(mode_dir, filename),
-                              os.path.join(mode_dir, new_name))
-                except Exception as e:
-                    QMessageBox.warning(self, "警告", f"重命名文件失败: {e}")
+            # 名称写入配置键，磁盘文件名保持不变（路径不按 OCR 命名）
             self.load_images(mode_path)
 
     @staticmethod
@@ -1939,6 +2361,9 @@ class ModeEditorDialog(QDialog):
             return "", None
 
         try:
+            # 传原始 crop：极性处理统一在 recognize_all_text 内部做（原始图 +
+            # box_thresh=0.5 为主、提对比度兜底）。这里不能再自己加 alpha=1.5——
+            # 暗字亮底的图（如『召唤鬼王』）加对比度后 det 反而全空。
             items = ocr_service.recognize_all_text(crop)
         except Exception as e:
             logger.warning(f"自动识别文字失败: {e}")
@@ -1947,21 +2372,101 @@ class ModeEditorDialog(QDialog):
         if not items:
             return "", []
 
-        # 主文字取置信度最高的一条；多条候选留给调用方打日志/提示
-        best = max(items, key=lambda d: d.get('confidence', 0.0))
-        text = (best.get('text') or '').strip()
+        # 主文字选法（与 _autofill_ocr_from_image 共用）：优先把「同一按钮内的
+# 多行文字」按阅读顺序拼成完整文案（『召唤』+『鬼王』→『召唤鬼王』），
+# 框太散/太长则退回置信 ≥0.8 的阅读顺序第一个。运行端已支持相邻行拼接
+# 匹配（_match_joined_lines），所以填整词是安全的。
+        text = ModeEditorDialog._compose_autofill_text(items)
+        best = next((d for d in items if (d.get('text') or '').strip() == text), None)
         if len(items) > 1:
             others = '、'.join(f"{d['text']}({d.get('confidence', 0):.2f})"
                               for d in items if d is not best)
             logger.info(f"  图上其余文字（未采用）：{others}")
         return text, items
 
+    @staticmethod
+    def _compose_autofill_text(items, max_len: int = 12) -> str:
+        """把识别到的多行文字合成「按钮完整文案」；不可信时退回单行。
+
+        规则：
+          - 单条 → 直接用；
+          - 多条且总长 ≤ max_len、且各文字框聚成一团（并集面积 ≤ 各框面积和的
+            3 倍，说明是同一个按钮的 2x2/多行排版）→ 按阅读顺序拼接；
+          - 否则（框太散，可能是画面里两处无关文字）→ 只取第一个高置信行。
+        """
+        try:
+            entries = []
+            for d in items or []:
+                t = str(d.get('text') or '').strip()
+                if t:
+                    entries.append((t, d.get('area')))
+            if not entries:
+                return ''
+            if len(entries) == 1:
+                return entries[0][0]
+
+            joined = ''.join(t for t, _a in entries)
+            if len(joined) > max_len:
+                return entries[0][0]
+
+            boxes = []
+            entry_boxes = []
+            for _t, a in entries:
+                try:
+                    xs = [float(p[0]) for p in a]
+                    ys = [float(p[1]) for p in a]
+                    if xs and ys:
+                        b = (min(xs), min(ys), max(xs), max(ys))
+                        boxes.append(b)
+                        entry_boxes.append(b)
+                except Exception:
+                    pass
+            if len(boxes) < 2:
+                return entries[0][0]
+
+            uw = max(b[2] for b in boxes) - min(b[0] for b in boxes)
+            uh = max(b[3] for b in boxes) - min(b[1] for b in boxes)
+            union_area = max(1.0, uw * uh)
+            sum_area = sum(max(1.0, (b[2] - b[0]) * (b[3] - b[1])) for b in boxes)
+            if union_area > sum_area * 3.0:
+                return entries[0][0]          # 分散在不同位置，不像同一按钮
+
+            # 按「行聚类」还原阅读顺序：竖直方向有重叠的算同一行，行内按 x 排。
+            # 不能简单按 y/常数 分桶——2x2 排版的『鬼』『王』常落在相邻桶里被排反。
+            pairs = [(t, b) for (t, _a), b in zip(entries, entry_boxes)] \
+                if len(entry_boxes) == len(entries) else None
+            if pairs is None:
+                return joined
+            rows = []
+            for t, b in sorted(pairs, key=lambda p: p[1][1]):
+                for row in rows:
+                    ry1 = min(x[1][1] for x in row)
+                    ry2 = max(x[1][3] for x in row)
+                    overlap = min(b[3], ry2) - max(b[1], ry1)
+                    if overlap > 0.5 * min(b[3] - b[1], ry2 - ry1):
+                        row.append((t, b))
+                        break
+                else:
+                    rows.append([(t, b)])
+            rows.sort(key=lambda r: min(x[1][1] for x in r))
+            ordered = []
+            for row in rows:
+                row.sort(key=lambda p: p[1][0])
+                ordered.extend(t for t, _b in row)
+            return ''.join(ordered)
+        except Exception:
+            try:
+                return str((items or [{}])[0].get('text') or '').strip()
+            except Exception:
+                return ''
+
     @classmethod
     def _detect_text_on_crop_path(cls, image_path: str):
         """同 _detect_text_on_crop，但入参是图片文件路径（供「替换图片」用）。"""
         try:
             import cv2
-            img = cv2.imread(image_path)
+            from OAT.utils.image_io import imread as _imread_safe
+            img = _imread_safe(image_path)
         except Exception as e:
             logger.warning(f"自动识别文字：无法读取图片 {image_path}（{e}）")
             return "", None
@@ -1988,6 +2493,39 @@ class ModeEditorDialog(QDialog):
         except Exception as e:
             logger.warning(f"读取 OCR 文字失败（{key}）: {e}")
         return ""
+
+    @staticmethod
+    def _write_label_of(mode_dir: str, key: str, label: str) -> bool:
+        """写「显示名」(label) 到 config.json（image_paths 与 pipeline 同步）。
+
+        label 纯显示用：不影响配置键、文件名、template 与任何识别行为——
+        改显示名不该造成后端配置变动（刻意解耦）。
+        """
+        cfg_path = os.path.join(mode_dir, 'config.json')
+        if not os.path.exists(cfg_path):
+            return False
+        try:
+            with open(cfg_path, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+            label = str(label or '').strip()
+            changed = False
+            ent = (config.get('image_paths') or {}).get(key)
+            if isinstance(ent, dict) and (ent.get('label') or '') != label:
+                ent['label'] = label
+                changed = True
+            for t in ((config.get('pipeline') or {}).get('tasks') or []):
+                if isinstance(t, dict) and t.get('name') == key \
+                        and (t.get('label') or '') != label:
+                    t['label'] = label
+                    changed = True
+            if not changed:
+                return True
+            with open(cfg_path, 'w', encoding='utf-8') as f:
+                json.dump(config, f, ensure_ascii=False, indent=2)
+            return True
+        except Exception as e:
+            logger.warning(f"写入显示名失败（{key}）: {e}")
+            return False
 
     @staticmethod
     def _write_ocr_text_of(mode_dir: str, key: str, new_text: str) -> bool:
@@ -2105,7 +2643,7 @@ class ModeEditorDialog(QDialog):
         
         # 构建图像路径
         if dir_name:
-            img_name = current_item.text()
+            img_name = self._item_file(current_item)
             img_path = os.path.join(self.source_dir, dir_name, img_name)
             
             # 确认删除
@@ -2114,9 +2652,88 @@ class ModeEditorDialog(QDialog):
                 if os.path.exists(img_path):
                     try:
                         os.remove(img_path)
+                        # 图片列表是扫目录建出来的，删文件不会动 config.json；
+                        # 必须同时清掉配置条目，否则下次开始挑战仍会加载这条死记录。
+                        self._purge_image_config(os.path.join(self.source_dir, dir_name),
+                                                 os.path.splitext(img_name)[0])
                         self.img_list.takeItem(self.img_list.row(current_item))
                     except Exception as e:
                         QMessageBox.warning(self, "警告", f"删除文件失败: {e}")
+
+    @staticmethod
+    def _purge_image_config(mode_dir: str, image_key: str) -> bool:
+        """从模式 config.json 里移除某张图的条目（image_paths + pipeline.tasks 双写）。
+
+        运行时真相是 pipeline.tasks，旧编辑器读 image_paths，两处都要删。
+        同时清理其它条目里指向它的 next / next_image 引用，避免留下指向空条目的
+        死链（死链会让识别流程卡在「等一个永远不会命中的图」直到超时）。
+        返回是否真的写盘了。
+        """
+        cfg_path = os.path.join(mode_dir, 'config.json')
+        if not os.path.exists(cfg_path):
+            return False
+        try:
+            with open(cfg_path, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+            if not isinstance(config, dict):
+                return False
+
+            changed = False
+
+            image_paths = config.get('image_paths')
+            # 先收该条目引用的停止图（image_paths 侧 + pipeline 侧），删条目时一并清文件
+            stop_rels = []
+            entry = image_paths.get(image_key) if isinstance(image_paths, dict) else None
+            if isinstance(entry, dict):
+                stop_rels.extend(entry.get('stop_images') or [])
+            pipeline = config.get('pipeline')
+            tasks = pipeline.get('tasks') if isinstance(pipeline, dict) else None
+            if isinstance(tasks, list):
+                for t in tasks:
+                    if isinstance(t, dict) and t.get('name') == image_key:
+                        stop_rels.extend(t.get('stop_images') or [])
+                        break
+            for rel in stop_rels:
+                try:
+                    p = os.path.join(mode_dir, rel)
+                    if os.path.exists(p):
+                        os.remove(p)
+                except Exception as e:
+                    logger.warning(f"删除停止图失败（忽略）: {rel}: {e}")
+
+            if isinstance(image_paths, dict) and image_key in image_paths:
+                del image_paths[image_key]
+                changed = True
+
+            if isinstance(tasks, list):
+                kept = [t for t in tasks
+                        if not (isinstance(t, dict) and t.get('name') == image_key)]
+                if len(kept) != len(tasks):
+                    pipeline['tasks'] = kept
+                    changed = True
+
+            # 悬空引用清理：谁还指着这张图，就把那个引用清空
+            if isinstance(image_paths, dict):
+                for entry in image_paths.values():
+                    if isinstance(entry, dict) and entry.get('next_image') == image_key:
+                        entry['next_image'] = ''
+                        changed = True
+            if isinstance(tasks, list):
+                for task in tasks:
+                    if isinstance(task, dict) and task.get('next') == image_key:
+                        task['next'] = ''
+                        changed = True
+
+            if not changed:
+                return False
+
+            with open(cfg_path, 'w', encoding='utf-8') as f:
+                json.dump(config, f, ensure_ascii=False, indent=2)
+            logger.info(f"已从配置中移除图像条目: {os.path.basename(mode_dir)}/{image_key}")
+            return True
+        except Exception as e:
+            logger.warning(f"移除图像配置失败（{image_key}）: {e}")
+            return False
      
     def _get_current_mode_path(self):
         """从模式树获取当前选中的模式路径，如 ['魂王'] 或 ['魂土', '队长']，未选中返回 []"""
@@ -2163,7 +2780,7 @@ class ModeEditorDialog(QDialog):
             QMessageBox.warning(self, "警告", "模式对应的目录名未设置")
             return
 
-        img_name = current_item.text()
+        img_name = self._item_file(current_item)
         mode_dir = os.path.join(self.source_dir, dir_name)
         dest_path = os.path.join(mode_dir, img_name)
         if not os.path.exists(dest_path):
@@ -2230,7 +2847,8 @@ class ModeEditorDialog(QDialog):
         """截图替换：选中一张图，直接框选游戏画面覆盖它。
 
         与「替换图片」的区别：不用先截好图存成文件再去资源管理器挑，
-        框选完直接覆盖。文件名、config.json 配置全部保持不变。
+        框选完直接覆盖。抓到文字时会按识别文字给图片改名（并同步改配置键与
+        next 引用）；没认到文字则保持原文件名。
         抓的是游戏窗口客户区，尺寸与识别时一致，能避免模板尺寸不匹配。
         """
         current_item = self.img_list.currentItem()
@@ -2247,7 +2865,7 @@ class ModeEditorDialog(QDialog):
             QMessageBox.warning(self, "警告", "模式对应的目录名未设置")
             return
 
-        img_name = current_item.text()
+        img_name = self._item_file(current_item)
         mode_dir = os.path.join(self.source_dir, dir_name)
         dest_path = os.path.join(mode_dir, img_name)
         if not os.path.exists(dest_path):
@@ -2289,7 +2907,9 @@ class ModeEditorDialog(QDialog):
         if QMessageBox.question(
             self, "确认替换",
             f"确定用刚框选的 {w}x{h} 画面替换\n{img_name}\n吗？\n"
-            f"原图将被覆盖，文件名不变。",
+            f"原图将被覆盖"
+            + (f"，并按识别文字改名为「{self._sanitize_image_stem(ocr_text)}」。" if ocr_text
+               else "，文件名不变（没认到文字）。"),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         ) != QMessageBox.StandardButton.Yes:
@@ -2319,10 +2939,22 @@ class ModeEditorDialog(QDialog):
             except Exception:
                 pass
 
+        # 按识别文字更新「显示名」(label)，**不动磁盘文件名、不动配置键/template**：
+        # 显示与后端解耦，改名不会引起任何后端配置变动。
+        rename_note = ""
+        new_key = key
+        if ocr_text:
+            label = self._sanitize_image_stem(ocr_text) or ocr_text.strip()
+            if label and self._write_label_of(mode_dir, key, label):
+                rename_note = f"\n显示名已按识别文字设为「{label}」"
+                logger.info(f"截图替换：显示名 {key} → {label}（配置键/文件名不变）")
+            else:
+                logger.warning(f"截图替换：显示名写入失败（保持 {key}）")
+
         # 按用户确认的结果同步 OCR 文字（图片已落地，这一步失败不影响替换本身）
         ocr_note = ""
         if apply_ocr_change and ocr_text:
-            if self._write_ocr_text_of(mode_dir, key, ocr_text):
+            if self._write_ocr_text_of(mode_dir, new_key, ocr_text):
                 ocr_note = f"\nOCR 识别文本已同步为「{ocr_text}」"
                 logger.info(f"截图替换：OCR 识别文本已更新 '{old_ocr_text}' → '{ocr_text}'")
             else:
@@ -2330,7 +2962,8 @@ class ModeEditorDialog(QDialog):
         elif ocr_text and old_ocr_text and old_ocr_text != ocr_text:
             ocr_note = f"\n（保留了原 OCR 识别文本「{old_ocr_text}」）"
 
-        QMessageBox.information(self, "成功", f"图片已替换：{img_name}{ocr_note}")
+        final_name = img_name
+        QMessageBox.information(self, "成功", f"图片已替换：{final_name}{rename_note}{ocr_note}")
         self.load_images(mode_path)
 
     def edit_image_config(self):
@@ -2373,7 +3006,7 @@ class ModeEditorDialog(QDialog):
         # 构建配置文件路径
         if dir_name:
             config_path = os.path.join(self.source_dir, dir_name, 'config.json')
-            image_name = current_item.text()
+            image_name = self._item_file(current_item)
 
             # 获取图像配置：pipeline 是运行时真相，优先 pipeline.tasks 格式
             config_data = self._load_image_config(os.path.dirname(config_path),
@@ -2383,7 +3016,7 @@ class ModeEditorDialog(QDialog):
             image_list = []
             for i in range(self.img_list.count()):
                 item = self.img_list.item(i)
-                image_list.append(item.text())
+                image_list.append(self._item_file(item))
             
             # 打开图像配置对话框
             dialog = ImageConfigDialog(self, image_name, config_data, config_path, image_list)
@@ -2479,7 +3112,7 @@ class ModeEditorDialog(QDialog):
             return
 
         mode_dir = os.path.join(self.source_dir, dir_name)
-        image_name = current_item.text()
+        image_name = self._item_file(current_item)
         img_path = os.path.join(mode_dir, image_name)
         try:
             with open(img_path, "rb") as f:
@@ -2491,11 +3124,23 @@ class ModeEditorDialog(QDialog):
         image_key = os.path.splitext(image_name)[0]
         config_data = self._load_image_config(mode_dir, image_key)
 
+        # 停止条件图一并带走：粘贴到别的模式时这些文件也要落地
+        stop_files = {}
+        for _rel in (config_data.get("stop_images") or []):
+            try:
+                _sp = os.path.join(mode_dir, _rel)
+                if os.path.exists(_sp):
+                    with open(_sp, "rb") as f:
+                        stop_files[_rel] = f.read()
+            except Exception as e:
+                logger.warning(f"读取停止图失败（忽略）: {_rel}: {e}")
+
         _IMAGE_CLIPBOARD.update({
             "image_name": image_name,
             "image_bytes": image_bytes,
             "config": config_data,
             "source_mode_dir": mode_dir,
+            "stop_files": stop_files,
         })
 
         mode_label = " -> ".join(mode_path)
@@ -2588,6 +3233,16 @@ class ModeEditorDialog(QDialog):
             QMessageBox.warning(self, "警告", f"保存配置失败: {e}")
             return
 
+        # 停止条件图落地到目标模式的 stop/ 目录（配置里的相对路径保持不变）
+        for _rel, _bytes in (_IMAGE_CLIPBOARD.get("stop_files") or {}).items():
+            try:
+                _sp = os.path.join(mode_dir, _rel)
+                os.makedirs(os.path.dirname(_sp), exist_ok=True)
+                with open(_sp, "wb") as f:
+                    f.write(_bytes)
+            except Exception as e:
+                logger.warning(f"写入停止图失败（忽略）: {_rel}: {e}")
+
         mode_label = " -> ".join(mode_path)
         self.clipboard_label.setText(
             f"已粘贴「{new_filename}」到 {mode_label}（图片 + 配置）")
@@ -2597,7 +3252,7 @@ class ModeEditorDialog(QDialog):
         self.load_images(mode_path)
         for i in range(self.img_list.count()):
             item = self.img_list.item(i)
-            if item.text() == new_filename:
+            if self._item_file(item) == new_filename:
                 self.img_list.setCurrentItem(item)
                 break
     
@@ -2657,8 +3312,8 @@ class ModeEditorDialog(QDialog):
 <ul style="margin-left: 20px;">
 <br>
 <strong><span style="color: #d9534f;">关于OCR：OCR是文字识别技术，在这里主要是识别游戏窗口内出现的文字内容，用于提高识别的精准度，但是会增加识别时间，建议在图像识别无法识别到时使用OCR</span></strong>
-<li>是否启用OCR：启用后会进行文字识别，默认值根据配置文件中的ocr_enabled字段</li>
-<li>OCR识别文本：需要识别的单个文本内容</li>
+<li>是否启用OCR：启用后会进行文字识别，默认勾选；旧配置按配置文件中的ocr_enabled字段显示</li>
+<li>OCR识别文本：需要识别的单个文本内容；添加图片配置时会自动识别图片上的文字填入（识别不到时需手动填写）</li>
 <li>OCR识别阈值：OCR识别的置信度阈值，默认值为0.8</li>
 <li>OCR识别后的操作：识别到文本后执行的操作（点击文字所在区域、点击点击区域设置的区域）</li>
 </ul>
