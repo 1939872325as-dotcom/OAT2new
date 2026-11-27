@@ -711,7 +711,11 @@ class WindowCapture:
                 target = Image.fromarray(cv2.cvtColor(target_image, cv2.COLOR_BGR2RGB))
 
             # 使用PyScreeze的locate函数查找目标图像
-            location = pyscreeze.locate(target, window_pil, confidence=threshold)
+            # 灰度开关与其它匹配路径共用（设置 → 灰度匹配，默认开）：
+            # 「后台运行 + 识别模式=pyscreeze」走的正是这一支
+            location = pyscreeze.locate(
+                target, window_pil, confidence=threshold,
+                grayscale=bool(getattr(settings, 'USE_GRAYSCALE', True)))
 
             if location:
                 # location 格式为 (x, y, width, height)
