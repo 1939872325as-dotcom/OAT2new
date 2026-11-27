@@ -175,6 +175,24 @@ class SettingsPage(QWidget):
         )
         group.addSettingCard(self.threshold_card)
 
+        # 灰度匹配：速度与颜色信息的取舍。默认开（快约 6 倍）；
+        # 需要区分「同形异色」的状态时关掉改回彩色，运行中切换立即生效。
+        self.grayscale_card = SwitchSettingCard(
+            FIF.PALETTE, "灰度匹配",
+            "开启后模板匹配快约 6 倍；代价是丢失颜色信息——形状相同、只有颜色"
+            "不同的两个状态会无法区分（如御魂稀有度边框、元素球）。识别率下降时"
+            "可关闭改回彩色",
+            parent=self
+        )
+        self.grayscale_card.checkedChanged.connect(
+            lambda checked: update_settings('use_grayscale', bool(checked))
+        )
+        self.grayscale_checkbox = self.grayscale_card.switchButton
+        self.grayscale_checkbox.setChecked(
+            bool(settings_data.get('use_grayscale', True))
+        )
+        group.addSettingCard(self.grayscale_card)
+
         self.edit_mode_card = PushSettingCard(
             "编辑模式和图像", FIF.EDIT,
             "模式和图像编辑", "编辑游戏模式的图像配置", self

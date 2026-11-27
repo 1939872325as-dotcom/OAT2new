@@ -11,6 +11,7 @@ import win32con
 
 from OAT.tools.GetDC import WindowCapture, effective_client_dy, warn_minimized_capture
 from OAT.tools import settings
+from OAT.tools.match_util import match_template
 from OAT.tools.human_click import foreground_click, human_drag
 from OAT.utils.OCRService import ocr_service
 from OAT.utils.logging import logger
@@ -235,8 +236,8 @@ class OpenCVRecognitionEngine(RecognitionEngine):
                 search = screenshot[y1:y2, x1:x2]
                 offset_x, offset_y = x1, y1
 
-            result = cv2.matchTemplate(search, target, cv2.TM_CCOEFF_NORMED)
-            min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
+            # 灰度/彩色由设置开关决定（match_util 内部处理；同一帧多任务复用灰度图）
+            max_val, max_loc = match_template(search, target)
 
             if max_val >= threshold:
                 x1, y1 = max_loc[0] + offset_x, max_loc[1] + offset_y

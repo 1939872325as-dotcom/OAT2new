@@ -25,6 +25,7 @@ except Exception as e:
         'sync_mode': 'exactly_sync',
         'find_value': 85,
         'find_mode': 'opencv',
+        'use_grayscale': True,
         'custom_res_width': 1441,
         'custom_res_height': 812,
         'window_arrange_mode': 'diagonal',  # 窗口排列方式：diagonal（对角线）或 tile（平铺）
@@ -36,6 +37,13 @@ except Exception as e:
 FIND_MODE = settings_data.get('find_mode', 'opencv')
 FIND_THRESHOLD = settings_data.get('find_value', 85)
 FIND_THRESHOLD_VALUE = FIND_THRESHOLD / 100.0  # 转换为0-1之间的值
+
+# 模板匹配是否走灰度（默认开）。
+# 灰度把三通道合成单通道，matchTemplate 耗时约为彩色的 1/6（1416x798 实测
+# 142ms→21ms），现有模板的分数与彩色一致；代价是丢失色度信息——「形状/亮度
+# 相同、只有颜色不同」的两个状态会变得不可区分（御魂稀有度边框、元素球、
+# 技能可用/冷却等）。识别率下降时可在设置里关掉，运行中切换立即生效。
+USE_GRAYSCALE = bool(settings_data.get('use_grayscale', True))
 
 # 其他配置变量
 # 窗口排列相关设置
@@ -83,7 +91,7 @@ def _flush_settings() -> None:
 
 def _apply_export(key, value) -> None:
     """同步更新模块级导出变量（立即生效，不等写盘）。"""
-    global FIND_MODE, FIND_THRESHOLD, FIND_THRESHOLD_VALUE
+    global FIND_MODE, FIND_THRESHOLD, FIND_THRESHOLD_VALUE, USE_GRAYSCALE
     global WINDOW_ARRANGE_MODE, WINDOWS_PER_ROW, BACKEND_GET_IMG_MODE
     global EMULATOR_TYPE, HANDLE_SPEC, SCREENSHOT_METHOD, CONTROL_METHOD, MUMU_FOLDER
     if key == 'find_mode':
@@ -91,6 +99,8 @@ def _apply_export(key, value) -> None:
     elif key == 'find_value':
         FIND_THRESHOLD = value
         FIND_THRESHOLD_VALUE = value / 100.0
+    elif key == 'use_grayscale':
+        USE_GRAYSCALE = bool(value)
     elif key == 'window_arrange_mode':
         WINDOW_ARRANGE_MODE = value
     elif key == 'windows_per_row':

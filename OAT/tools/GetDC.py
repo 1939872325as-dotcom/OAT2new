@@ -11,6 +11,7 @@ from typing import Optional, Tuple, Union
 import pyscreeze
 from PIL import Image
 from OAT.tools import settings
+from .match_util import match_template
 from OAT.utils.logging import logger
 from OAT.utils.warning_box import warning_box
 
@@ -665,11 +666,8 @@ class WindowCapture:
             # 获取目标图像尺寸
             h, w = target.shape[:2]
 
-            # 使用TM_CCOEFF_NORMED算法进行匹配
-            result = cv2.matchTemplate(window_img, target, cv2.TM_CCOEFF_NORMED)
-
-            # 查找最佳匹配位置
-            min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
+            # 使用TM_CCOEFF_NORMED算法进行匹配（灰度/彩色由设置开关决定）
+            max_val, max_loc = match_template(window_img, target)
 
             # 检查匹配度是否超过阈值
             if max_val >= threshold:

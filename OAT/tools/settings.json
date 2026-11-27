@@ -6,6 +6,7 @@
   "sync_mode": "exactly_sync",
   "find_value": 93,
   "find_mode": "pyscreeze",
+  "use_grayscale": true,
   "custom_res_width": 1417,
   "custom_res_height": 798,
   "window_arrange_mode": "diagonal",
