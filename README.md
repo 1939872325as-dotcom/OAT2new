@@ -1,7 +1,7 @@
 # OAT2new
 
 <div align="center">
-    <img src="https://img.shields.io/badge/version-v2.3.8-blue.svg" alt="Version">
+    <img src="https://img.shields.io/badge/version-v2.3.9-blue.svg" alt="Version">
     <img src="https://img.shields.io/badge/system-Windows-blue.svg" alt="System">
     <img src="https://img.shields.io/badge/python-v3.12-blue.svg" alt="Python">
     <img src="https://img.shields.io/badge/license-GPL--3.0-green.svg" alt="License">
@@ -38,7 +38,7 @@ OAT2new 是一个 Windows 上的阴阳师自动化工具：用 **模板匹配 + 
 
 ## 🚀 快速开始
 
-1. 下载打包版：[**OAT2new-v2.3.8.zip**](https://github.com/1939872325as-dotcom/OAT2new/releases/download/OTA2new-v2.3.8/OAT2new-v2.3.8.zip)
+1. 下载打包版：[**OAT2new-v2.3.9.zip**](https://github.com/1939872325as-dotcom/OAT2new/releases/download/OTA2new-v2.3.9/OAT2new-v2.3.9.zip)
    （或到 [Releases](https://github.com/1939872325as-dotcom/OAT2new/releases) 选版本）
 2. 解压到任意目录，双击 **`启动OAT2.exe`**（或进入 `app\` 运行 `OAT2.exe`），建议以管理员身份运行
    （游戏常以管理员运行，普通权限会被 UIPI 拒绝后台操作）
@@ -162,8 +162,12 @@ OAT2new 是一个 Windows 上的阴阳师自动化工具：用 **模板匹配 + 
 
 ## 🎨 灰度匹配（速度与精度的取舍）
 
-**设置 → 灰度匹配**，默认**开启**。它只作用于「模板匹配」这条通道，OCR 不受影响；
-运行中切换立即生效，不用重启。
+**设置 → 灰度匹配**，默认**开启**。它只作用于「特征匹配」（模板匹配）这条通道；
+OCR 走模型推理，完全不受影响。运行中切换立即生效，不用重启。
+
+**实现方式**：灰度转换装在 `cv2.matchTemplate` 这一层统一生效 —— pyscreeze、pyautogui
+以及以后新增的任何匹配调用都会自动继承，不需要逐个调用点配置。需要彩色匹配的特例
+可以用 `match_util.color_mode()` 临时绕过。
 
 ### 为什么默认开
 
@@ -254,6 +258,7 @@ python build_release.py
 - [操作指引 · 随机点击与随机等待](./docs/操作指引-随机点击与随机等待.md)
 - [操作指引 · 配置与截图逻辑](./docs/操作指引-配置与截图逻辑.md)
 - [操作指引 · 模式与图片编辑（新手）](./docs/操作指引-模式与图片编辑(新手).md)
+- [2.3.9 发布说明](./docs/发布说明-2.3.9.md) —— 灰度改为全局安装（cv2.matchTemplate 层）
 - [2.3.8 发布说明](./docs/发布说明-2.3.8.md) —— 补全灰度覆盖（pyscreeze 分支）
 - [2.3.7 发布说明](./docs/发布说明-2.3.7.md) —— 模板匹配灰度化，实测快约 6 倍
 - [2.3.6 发布说明](./docs/发布说明-2.3.6.md)

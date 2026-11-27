@@ -256,25 +256,20 @@ class OnmyojiAutomation:
 
         # 执行图像识别
         target = None
-        # 灰度开关与 MAA 管道共用（设置 → 灰度匹配，默认开）：
-        # pyscreeze 内部也是 TM_CCOEFF_NORMED，灰度后同样快约 6 倍
-        _gray = bool(getattr(settings, 'USE_GRAYSCALE', True))
         try:
             # 使用预加载的图像模板而不是文件路径
             if logo in self.image_templates:
                 target = pyautogui.locateOnScreen(
                     self.image_templates[logo],
                     confidence=self.default_confidence,
-                    region=self.area,
-                    grayscale=_gray
+                    region=self.area
                 )
             else:
                 # 降级到文件路径方式
                 target = pyautogui.locateOnScreen(
                     logo,
                     confidence=self.default_confidence,
-                    region=self.area,
-                    grayscale=_gray
+                    region=self.area
                 )
         except pyautogui.ImageNotFoundException:
             # 未找到图像时设置target为None

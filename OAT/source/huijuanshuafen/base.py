@@ -20,7 +20,6 @@ import win32gui
 
 from OAT.pipeline.recognition import RecognitionResult
 from OAT.pipeline.recognition_opencv import OpenCVRecognitionEngine
-from OAT.tools.match_util import match_template
 from OAT.utils.OCRService import ocr_service
 from OAT.utils.logging import logger
 from OAT.utils.pause_state import wait_if_paused
@@ -151,7 +150,8 @@ class BaseBot:
             th, tw = target.shape[:2]
             if search.shape[0] < th or search.shape[1] < tw:
                 return (0.0, None)
-            max_val, max_loc = match_template(search, target)
+            result = cv2.matchTemplate(search, target, cv2.TM_CCOEFF_NORMED)
+            _, max_val, _, max_loc = cv2.minMaxLoc(result)
             best = (max_loc[0] + offset_x, max(0, max_loc[1] + offset_y - tb))
             return (float(max_val), best)
         except Exception:
@@ -439,7 +439,8 @@ class BaseBot:
             offset_x, offset_y = x1, y1
 
         h, w = target.shape[:2]
-        max_val, max_loc = match_template(search, target)
+        result = cv2.matchTemplate(search, target, cv2.TM_CCOEFF_NORMED)
+        _, max_val, _, max_loc = cv2.minMaxLoc(result)
         if max_val < threshold:
             return None
         x, y = max_loc[0] + offset_x, max(0, max_loc[1] + offset_y - tb)

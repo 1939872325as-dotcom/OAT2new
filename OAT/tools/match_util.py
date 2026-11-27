@@ -1,20 +1,19 @@
-"""模板匹配的统一入口：灰度 / 彩色由设置开关决定（默认灰度）。
+"""模板匹配的灰度层：一处安装，所有特征匹配默认走灰度。
 
-为什么要有这一层：
-- 灰度把三通道合成单通道，`matchTemplate` 的耗时约为彩色的 1/6
-  （1416x798 全帧实测 142ms → 21ms，10 张模板一轮 1.3s → 0.22s）。
-  现有 117 张模板的分数与彩色一致（正样本最低分、负样本最高分都在同一档）。
-- 代价是丢掉色度：**「形状/亮度相同、只有颜色不同」的两个状态会变得不可区分**
-  （御魂稀有度边框、元素球、技能可用/冷却、选中金边等）。这类场景要关掉灰度。
+为什么挂在 `cv2.matchTemplate` 这一层：
+- 非 OCR 的识别最终都落到 `cv2.matchTemplate`（pyscreeze / pyautogui 内部也是它），
+  在这里统一转换，**新增调用点、第三方库调用都自动继承**，不需要每个调用点单独配。
+- OCR 走模型推理，不经过 matchTemplate，完全不受影响。
 
-开关在「设置 → 识别阈值」下方，运行中切换立即生效（每次匹配现读 settings）。
+开关：设置 → 灰度匹配（`settings.USE_GRAYSCALE`，默认 True），运行中切换立即生效。
+需要彩色匹配的特例：`with match_util.color_mode(): cv2.matchTemplate(...)`。
 
-性能细节：同一帧会被一轮内的多个任务复用，`to_match_image` 按线程缓存最近一帧的
-灰度图（线程池里每个线程各留一份），避免每个任务都重做一次 1416x798 的 cvtColor。
+性能：同一帧会被一轮内多个任务复用，灰度图按线程缓存最近一份（只缓存大图）。
 """
 import threading
 
 import cv2
+import numpy as np
 
 from OAT.tools import settings
 
@@ -24,6 +23,8 @@ _local = threading.local()
 # 而且单张小图的 cvtColor 只要几十微秒，不值得缓存。
 _CACHE_MIN_PIXELS = 200_000
 
+_INSTALLED = False
+
 
 def is_grayscale() -> bool:
     """当前是否走灰度（供日志/自检显示）。"""
@@ -31,10 +32,16 @@ def is_grayscale() -> bool:
 
 
 def to_match_image(img):
-    """按设置把图像转成匹配用的通道数；None 原样返回。"""
-    if img is None:
-        return None
-    if not is_grayscale() or getattr(img, 'ndim', 0) != 3:
+    """按设置把图像转成匹配用的通道数；None / 非 ndarray 原样返回。"""
+    if img is None or not isinstance(img, np.ndarray):
+        return img
+    if not is_grayscale() or img.ndim != 3:
+        return img
+
+    channels = img.shape[2]
+    if channels == 4:
+        return cv2.cvtColor(img, cv2.COLOR_BGRA2GRAY)
+    if channels != 3:
         return img
 
     if img.size >= _CACHE_MIN_PIXELS:
@@ -48,11 +55,48 @@ def to_match_image(img):
     return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
 
-def match_template(search, target, method=cv2.TM_CCOEFF_NORMED):
-    """灰度/彩色自适应的一次匹配，返回 (max_val, max_loc)。
+class color_mode:
+    """临时绕过灰度（需要彩色匹配的特例用）。
 
-    调用方负责保证 search 不小于 target（OpenCV 尺寸不足会抛错）。
+    用法：
+        with match_util.color_mode():
+            cv2.matchTemplate(color_img, color_tpl, cv2.TM_CCOEFF_NORMED)
     """
-    result = cv2.matchTemplate(to_match_image(search), to_match_image(target), method)
-    _, max_val, _, max_loc = cv2.minMaxLoc(result)
-    return float(max_val), max_loc
+
+    def __enter__(self):
+        _local.bypass = True
+        return self
+
+    def __exit__(self, *exc):
+        _local.bypass = False
+        return False
+
+
+def install_global_patch() -> bool:
+    """把灰度转换挂到 cv2.matchTemplate 上（幂等，返回是否已安装）。"""
+    global _INSTALLED
+    if _INSTALLED:
+        return True
+
+    original = getattr(cv2, 'matchTemplate', None)
+    if original is None:
+        return False
+
+    def _match_template(image, templ, method, result=None, mask=None):
+        if not getattr(_local, 'bypass', False):
+            image = to_match_image(image)
+            templ = to_match_image(templ)
+            if isinstance(mask, np.ndarray) and mask.ndim == 3:
+                mask = to_match_image(mask)
+        if result is None:
+            if mask is None:
+                return original(image, templ, method)
+            return original(image, templ, method, None, mask)
+        return original(image, templ, method, result, mask)
+
+    _match_template.__name__ = 'matchTemplate'
+    _match_template.__doc__ = ((original.__doc__ or '')
+                               + '\n[OAT] 灰度层：默认把彩色图转灰度后匹配')
+    cv2.matchTemplate = _match_template
+    _INSTALLED = True
+    return True
