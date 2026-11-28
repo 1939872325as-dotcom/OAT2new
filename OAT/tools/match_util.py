@@ -27,6 +27,7 @@ import cv2
 import numpy as np
 
 from OAT.tools import settings
+from OAT.utils.logging import logger
 
 _local = threading.local()
 
@@ -98,18 +99,15 @@ class color_mode:
         return False
 
 
-def _color_verify_ok(image, templ, loc, method, gray_score):
-    """在灰度命中的位置上取原彩色小窗复核。返回 True=可信（不否决）。"""
+def _color_verify_score(image, templ, loc, method):
+    """在灰度命中的位置上取原彩色小窗，返回彩色分（算不了返回 None）。"""
     y, x = loc[1], loc[0]
     h, w = templ.shape[:2]
     patch = image[y:y + h, x:x + w]
     if patch.shape[:2] != (h, w):
-        return True
+        return None
     r = _original_matchTemplate(patch, templ, method)
-    color_score = float(r.max())
-    # 只否决「彩色分明显低于灰度分」：这是色度对不上的信号。
-    # 真命中/光度退化（模糊、遮挡、亮度变化）时两者同步下降，差值 <0.05。
-    return color_score >= gray_score - _VERIFY_GAP
+    return float(r.max())
 
 
 def _suppress_color_mismatch(image, templ, res, method):
@@ -117,6 +115,7 @@ def _suppress_color_mismatch(image, templ, res, method):
 
     压制 = 把该峰周围一块区域置 -1（覆盖相关峰簇 + 模板足迹），然后在剩余矩阵上
     继续找最高峰，直到最高峰可信或低于 _VERIFY_FLOOR。未发生压制时不拷贝矩阵。
+    每次压制都写一条后台日志（前端不显示）——「偶发性不识别」排查全靠它。
     """
     h, w = templ.shape[:2]
     H, W = res.shape[:2]
@@ -128,7 +127,8 @@ def _suppress_color_mismatch(image, templ, res, method):
             _, mx, _, mxl = cv2.minMaxLoc(res)
             if mx < _VERIFY_FLOOR:
                 break
-            if _color_verify_ok(image, templ, mxl, method, mx):
+            cs = _color_verify_score(image, templ, mxl, method)
+            if cs is None or cs >= mx - _VERIFY_GAP:
                 break
             if not modified:
                 res = res.copy()
@@ -136,6 +136,13 @@ def _suppress_color_mismatch(image, templ, res, method):
             x1, y1 = max(0, mxl[0] - pad), max(0, mxl[1] - pad)
             x2, y2 = min(W, mxl[0] + w + pad), min(H, mxl[1] + h + pad)
             res[y1:y2, x1:x2] = -1.0
+            logger.log_to_file({
+                'level': 'WARNING',
+                'module': 'OAT.tools.match_util',
+                'message': (f"彩色复核否决：灰度分 {mx:.3f} @({mxl[0]},{mxl[1]}) "
+                            f"彩色分 {cs:.3f}（差 {mx - cs:.3f} ≥ {_VERIFY_GAP}），"
+                            f"判同形异色，压制后继续找次优"),
+            })
         return res
     except Exception:
         return original_res

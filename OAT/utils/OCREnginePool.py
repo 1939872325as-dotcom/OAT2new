@@ -43,6 +43,10 @@ def _gpu_provider_available() -> bool:
     except Exception:
         return False
 
+# 单次 OCR 推理的挂死判定（秒）：整帧实测 0.15~0.5s，20s 已是几十倍余量；
+# 超时就重新派发（原 60s：引擎偶发挂死时会把「偶发性不识别」放大成整分钟卡死）。
+_INFER_TIMEOUT = 20.0
+
 
 class _Task:
     """一次推理请求：图片 + 每调用参数 + 完成事件 + 结果槽。"""
@@ -229,10 +233,12 @@ class OCREnginePool:
         的 __call__ 都支持这些覆盖键（已核对源码）。
         """
         task = self._dispatch(img, kwargs)
-        if not task.event.wait(timeout=60.0):
-            # 引擎疑似挂死（60s 无响应）：不再等，重新派一次（挂死引擎在途数没清零，
+        if not task.event.wait(timeout=_INFER_TIMEOUT):
+            # 引擎疑似挂死（20s 无响应）：不再等，重新派一次（挂死引擎在途数没清零，
             # 调度分会自动避开它；若另一引擎也不可用则只能继续等）。
-            logger.warning("OCR引擎推理超时(60s)，重新派发")
+            # 20s 的依据：整帧 OCR 实测 0.15~0.5s，20s 已是 40 倍余量；
+            # 60s 会让「偶发性不识别」看起来像卡死（实测 11:01:04 挂过一次）。
+            logger.warning(f"OCR引擎推理超时({_INFER_TIMEOUT:g}s)，重新派发")
             task = self._dispatch(img, kwargs)
             if not task.event.wait(timeout=90.0):
                 return None

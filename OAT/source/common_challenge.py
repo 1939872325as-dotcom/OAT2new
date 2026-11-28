@@ -24,6 +24,13 @@ from OAT.utils.error_handler import log_error
 # 所以保留一段固定节流兜底（值按需调整，与按图配置无关）。
 NO_MATCH_WAIT_RANGE = (0.7, 2.0)
 
+# 链等待复检延迟（秒）：等待 next 超过它就复检「上一张图」是否还在画面上。
+# 上一步点击落在画面刷新瞬间没生效时（实测：结界突破点完结界、列表正在刷新，
+# next 链只盯「进攻」干等 15 秒才超时），复检命中就重置流程重新处理，
+# 把最坏死等从 NEXT_IMAGE_TIMEOUT 缩到这个延迟。与 pipeline.runner 的
+# 等待期起点复检（WAIT_START_RECHECK_DELAY）同一设计。
+CHAIN_RECHECK_DELAY = 3.0
+
 
 class CommonChallenge:
     """
@@ -267,6 +274,8 @@ class CommonChallenge:
             consecutive_count = {}
             # 跟踪开始识别下一个图片的时间
             next_image_start_time = None
+            # 链等待复检标记：每个等待段只复检一次（对哪个 next 做过复检）
+            _chain_rechecked_for = None
             # 超时时间（秒）
             NEXT_IMAGE_TIMEOUT = 15
 
@@ -347,6 +356,46 @@ class CommonChallenge:
                         next_image_start_time = None
                         consecutive_count = {}
                     else:
+                        # 复检：等待超过 CHAIN_RECHECK_DELAY 时，检查「上一张图」
+                        # （next_image 指向当前目标的那批图）是否还在画面上 —— 还在就说明
+                        # 上一步点击没有生效（实测：点完结界时列表正在刷新，点击落空），
+                        # 重置流程回到默认识别，下轮会重新点到它，不必干等 15 秒超时。
+                        # 与 pipeline.runner 的等待期起点复检（WAIT_START_RECHECK_DELAY）同一设计。
+                        if (time.time() - next_image_start_time > CHAIN_RECHECK_DELAY
+                                and _chain_rechecked_for != current_next_image):
+                            _chain_rechecked_for = current_next_image
+                            for key in self.ordered_keys:
+                                pinfo = self.image_info.get(key, {})
+                                if (pinfo.get('next_image') != current_next_image
+                                        or key not in self.image_paths):
+                                    continue
+                                try:
+                                    if self.automation_obj.perform_action(
+                                        self.image_paths[key],
+                                        hidden_window=self.hidden_window,
+                                        sync_mode=self.sync_mode,
+                                        click_type=pinfo['click_type'],
+                                        click_area=pinfo['click_area'],
+                                        ocr_enabled=pinfo['ocr_enabled'],
+                                        ocr_target_text=pinfo['ocr_target_text'],
+                                        ocr_action=pinfo['ocr_action'],
+                                        ocr_region=pinfo['ocr_region'],
+                                        ocr_confidence_threshold=pinfo['ocr_confidence_threshold'],
+                                        click_wait_min=pinfo['click_wait_min'],
+                                        click_wait_max=pinfo['click_wait_max'],
+                                        stop_images=pinfo.get('stop_images_abs'),
+                                        stop_time=pinfo.get('stop_time'),
+                                    ):
+                                        acted = True
+                                        logger.warning(
+                                            f"等待「{current_next_image}」期间画面仍显示「{key}」"
+                                            f"：上一步点击很可能没有生效，重置流程并重新处理"
+                                            f"（elapsed={time.time() - next_image_start_time:.1f}s DELAY={CHAIN_RECHECK_DELAY}）")
+                                        current_next_image = None
+                                        consecutive_count = {}
+                                        break
+                                except Exception as e:
+                                    logger.warning(f"复检图片 {key} 失败（忽略）: {e}")
                         if current_next_image in self.image_paths:
                             matched_key = current_next_image
                             img_path = self.image_paths[matched_key]
@@ -397,6 +446,8 @@ class CommonChallenge:
                                         consecutive_count = {}
                                     # 更新下一个图片
                                     current_next_image = info['next_image']
+                                    # 新的等待段允许重新复检
+                                    _chain_rechecked_for = None
                                     # 重置开始时间
                                     next_image_start_time = None
                                     # 切换到不同图片时重置连续出现次数（原实现引用了未定义的 key）
@@ -459,6 +510,8 @@ class CommonChallenge:
                                             consecutive_count = {}
                                         # 更新下一个图片
                                         current_next_image = info['next_image']
+                                        # 新的等待段允许重新复检
+                                        _chain_rechecked_for = None
                                         # 重置开始时间
                                         next_image_start_time = None
                                         # 切换到不同图片时重置连续出现次数

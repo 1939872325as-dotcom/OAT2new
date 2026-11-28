@@ -1,7 +1,7 @@
 # OAT2new
 
 <div align="center">
-    <img src="https://img.shields.io/badge/version-v2.3.10-blue.svg" alt="Version">
+    <img src="https://img.shields.io/badge/version-v2.3.11-blue.svg" alt="Version">
     <img src="https://img.shields.io/badge/system-Windows-blue.svg" alt="System">
     <img src="https://img.shields.io/badge/python-v3.12-blue.svg" alt="Python">
     <img src="https://img.shields.io/badge/license-GPL--3.0-green.svg" alt="License">
@@ -38,7 +38,7 @@ OAT2new 是一个 Windows 上的阴阳师自动化工具：用 **模板匹配 + 
 
 ## 🚀 快速开始
 
-1. 下载打包版：[**OAT2new-v2.3.10.zip**](https://github.com/1939872325as-dotcom/OAT2new/releases/download/OTA2new-v2.3.10/OAT2new-v2.3.10.zip)
+1. 下载打包版：[**OAT2new-v2.3.11.zip**](https://github.com/1939872325as-dotcom/OAT2new/releases/download/OTA2new-v2.3.11/OAT2new-v2.3.11.zip)
    （或到 [Releases](https://github.com/1939872325as-dotcom/OAT2new/releases) 选版本）
 2. 解压到任意目录，双击 **`启动OAT2.exe`**（或进入 `app\` 运行 `OAT2.exe`），建议以管理员身份运行
    （游戏常以管理员运行，普通权限会被 UIPI 拒绝后台操作）
@@ -263,6 +263,7 @@ python build_release.py
 - [操作指引 · 随机点击与随机等待](./docs/操作指引-随机点击与随机等待.md)
 - [操作指引 · 配置与截图逻辑](./docs/操作指引-配置与截图逻辑.md)
 - [操作指引 · 模式与图片编辑（新手）](./docs/操作指引-模式与图片编辑(新手).md)
+- [2.3.11 发布说明](./docs/发布说明-2.3.11.md) —— 链等待 15s 死等改 3s 复检；OCR 挂死 60s→20s；复核可排查
 - [2.3.10 发布说明](./docs/发布说明-2.3.10.md) —— 灰度层新增彩色复核（同形异色否决）
 - [2.3.9 发布说明](./docs/发布说明-2.3.9.md) —— 灰度改为全局安装（cv2.matchTemplate 层）
 - [2.3.8 发布说明](./docs/发布说明-2.3.8.md) —— 补全灰度覆盖（pyscreeze 分支）
